@@ -58,6 +58,23 @@ def save_users(users: set):
             f.write(f"{uid}\n")
 
 
+def register_user_if_new(user_id: int):
+    """Registers user on first interaction with default notifications enabled."""
+    users = load_users()
+    if user_id not in users:
+        users.add(user_id)
+        save_users(users)
+        settings_data = load_all_user_settings()
+        if str(user_id) not in settings_data:
+            settings_data[str(user_id)] = {
+                "broadcast": True,
+                "show_owner": True,
+                "show_moders": True,
+                "show_players": True
+            }
+            save_all_user_settings(settings_data)
+
+
 def load_all_user_settings() -> dict:
     if not os.path.exists(SETTINGS_FILE):
         return {}
@@ -84,7 +101,7 @@ def get_user_settings(user_id: int) -> dict:
 
 
 async def broadcast(text: str):
-    """Broadcasts a message only to users who have broadcasts enabled."""
+    """Broadcasts a message only to users who have auto notifications enabled."""
     settings_data = load_all_user_settings()
     users = load_users()
     for user_id in users:
@@ -190,30 +207,24 @@ def get_stop_keyboard() -> InlineKeyboardMarkup:
 
 def get_main_menu_text() -> str:
     return (
-        "👋 <b>Welcome to Server Monitor Bot!</b>\n"
-        "You have successfully subscribed.\n\n"
+        "👋 <b>Welcome to Server Monitor Bot!</b>\n\n"
         "<b>Commands:</b>\n"
         " /status — get current server state\n"
         " /settings — configure display toggles & notifications\n"
-        " /stop — unsubscribe"
+        " /stop — disable auto notifications"
     )
 
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    users = load_users()
-    users.add(message.from_user.id)
-    save_users(users)
-
+    register_user_if_new(message.from_user.id)
     await message.answer(get_main_menu_text(), parse_mode="HTML")
 
 
 @dp.message(Command("settings"))
 async def cmd_settings(message: Message):
     user_id = message.from_user.id
-    users = load_users()
-    users.add(user_id)
-    save_users(users)
+    register_user_if_new(user_id)
 
     await message.answer(
         "⚙️ <b>Bot Settings & Preferences</b>\n\n"
@@ -229,6 +240,7 @@ async def cmd_settings(message: Message):
 ])
 async def process_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
+    register_user_if_new(user_id)
     
     if callback.data == "main_menu":
         try:
@@ -309,26 +321,32 @@ async def process_callback(callback: CallbackQuery):
 
 @dp.message(Command("stop"))
 async def cmd_stop(message: Message):
-    users = load_users()
-    if message.from_user.id in users:
-        users.remove(message.from_user.id)
-        save_users(users)
-        await message.answer(
-            "🔕 <b>You have unsubscribed.</b> Send /start to subscribe again.",
-            reply_markup=get_stop_keyboard(),
-            parse_mode="HTML"
-        )
-    else:
-        await message.answer(
-            "You are not subscribed.",
-            reply_markup=get_stop_keyboard(),
-            parse_mode="HTML"
-        )
+    user_id = message.from_user.id
+    register_user_if_new(user_id)
+
+    settings_data = load_all_user_settings()
+    user_cfg = settings_data.get(str(user_id), {
+        "broadcast": True,
+        "show_owner": True,
+        "show_moders": True,
+        "show_players": True
+    })
+    user_cfg["broadcast"] = False
+    settings_data[str(user_id)] = user_cfg
+    save_all_user_settings(settings_data)
+
+    await message.answer(
+        "🔕 <b>Auto notifications disabled.</b> You can turn them back on in /settings.",
+        reply_markup=get_stop_keyboard(),
+        parse_mode="HTML"
+    )
 
 
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
     user_id = message.from_user.id
+    register_user_if_new(user_id)
+
     if current_status_cache["is_down"]:
         await message.answer(
             "⚠️ <b>Server is unavailable</b>, please try again later.", 
@@ -387,7 +405,6 @@ async def monitor_loop():
             if current_minute == 0 and last_reported_hour != current_hour:
                 formatted_time = now_time_utc.strftime('%H:00')
                 
-                # Формируем компактный блок с именами владельца, модераторов и игроков
                 owner_status_str = "🟢 <b>Online</b>" if curr_owner else "🔴 <b>Offline</b>"
                 owner_line = f"👑 <b>Owner:</b> <code>{OWNER_NICKNAME}</code> — {owner_status_str}"
                 
