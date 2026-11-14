@@ -371,7 +371,6 @@ async def monitor_loop():
     moders_last_seen = None
     moders_45_notified = False
 
-    server_was_down = False
     last_reported_hour = -1
 
     owner_lower = OWNER_NICKNAME.lower()
@@ -383,7 +382,6 @@ async def monitor_loop():
 
         try:
             status = await server.async_status()
-            server_was_down = False
             current_status_cache["is_down"] = False
 
             sample_players = status.players.sample if status.players.sample else []
@@ -502,10 +500,7 @@ async def monitor_loop():
 
         except Exception as e:
             current_status_cache["is_down"] = True
-            if not server_was_down:
-                await broadcast("⚠️ <b>Server is unavailable</b>, please try again later.")
-                server_was_down = True
-                print(f"[Server unavailable]: {e}")
+            print(f"[Server unavailable]: {e}")
 
         await asyncio.sleep(CHECK_INTERVAL)
 
