@@ -399,8 +399,8 @@ async def monitor_loop():
             current_status_cache["online_moders"] = curr_moders_list
             current_status_cache["all_players"] = all_player_names
 
-            # Hourly report at exact 00 minutes
-            if current_minute == 0 and last_reported_hour != current_hour:
+            # Hourly report at exact 00 minutes (skipped on very first iteration if owner_online is None)
+            if owner_online is not None and current_minute == 0 and last_reported_hour != current_hour:
                 formatted_time = now_time_utc.strftime('%H:00')
                 
                 owner_status_str = "🟢 <b>Online</b>" if curr_owner else "🔴 <b>Offline</b>"
@@ -428,6 +428,7 @@ async def monitor_loop():
             elif current_minute != 0:
                 last_reported_hour = -1
 
+            # First run initialization (silent sync, no spam on startup)
             if owner_online is None:
                 owner_online = curr_owner
                 moders_count = curr_moders_count
