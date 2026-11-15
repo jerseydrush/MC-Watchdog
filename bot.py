@@ -273,7 +273,7 @@ def get_stop_keyboard() -> InlineKeyboardMarkup:
 
 def get_main_menu_text() -> str:
     return (
-        "👋 <b>Welcome to Server Monitor Bot!</b>\n\n"
+        "👋 <b>Welcome to MC Watchdog!</b>\n\n"
         "<b>Commands:</b>\n"
         " /status — get current server state\n"
         " /settings — configure display toggles & notifications\n"
@@ -557,35 +557,7 @@ async def monitor_loop():
                 moders_last_seen = current_timestamp
                 moders_45_notified = False
             elif curr_moders_count > 0:
-                moders_45_notified = False
-
-            # Unified staff state change notification (prevents duplicate Preliminary alerts)
-            if (curr_owner != owner_online) or (curr_moders_count != moders_count):
-                mod_names_str = f"Moderators online: {', '.join(f'<code>{m}</code>' for m in curr_moders_list)}"
-
-                if not curr_owner and curr_moders_count > 0:
-                    await broadcast(
-                        f"👑 <code>{OWNER_NICKNAME}</code> is <b>offline</b> (Preliminary).\n🛡️ {mod_names_str}.",
-                        "notify_prelim"
-                    )
-                elif curr_owner and curr_moders_count == 0:
-                    await broadcast(
-                        f"👑 <code>{OWNER_NICKNAME}</code> is <b>online</b>, Moderators are <b>offline</b>.",
-                        "notify_prelim"
-                    )
-                elif curr_owner and curr_moders_count > 0:
-                    await broadcast(
-                        f"👑 <code>{OWNER_NICKNAME}</code> is <b>online</b>.\n🛡️ {mod_names_str}.",
-                        "notify_prelim"
-                    )
-                elif not curr_owner and curr_moders_count == 0:
-                    await broadcast(
-                        f"👑 <code>{OWNER_NICKNAME}</code> is <b>offline</b> (Preliminary), Moderators are <b>offline</b>.",
-                        "notify_prelim"
-                    )
-
-            owner_online = curr_owner
-            moders_count = curr_moders_count
+                moders_notified = False  # Reset moderation notification flags if needed
 
             # 45-minute timeout checks
             owner_45_ready = (
@@ -601,6 +573,61 @@ async def monitor_loop():
 
             if owner_45_ready:
                 current_status_cache["owner_completely_offline"] = True
+
+            # Unified staff state change & entrance/status notifications
+            if (curr_owner != owner_online) or (curr_moders_count != moders_count):
+                mod_names_str = f"Moderators online: {', '.join(f'<code>{m}</code>' for m in curr_moders_list)}"
+
+                if curr_owner and not owner_online:
+                    # Владелец зашел в сеть, проверяем статус модераторов (просто офлайн или completely)
+                    if curr_moders_count == 0:
+                        moders_status_text = "Moderators are <b>completely offline</b> (>45m)" if moders_45_ready else "Moderators are <b>offline</b>"
+                    else:
+                        moders_status_text = f"🛡️ {mod_names_str}"
+
+                    await broadcast(
+                        f"👑 <code>{OWNER_NICKNAME}</code> is <b>online</b>.\n🛡️ {moders_status_text}.",
+                        "notify_prelim"
+                    )
+                elif not curr_owner and curr_owner != owner_online:
+                    if curr_moders_count > 0:
+                        await broadcast(
+                            f"👑 <code>{OWNER_NICKNAME}</code> is <b>offline</b> (Preliminary).\n🛡️ {mod_names_str}.",
+                            "notify_prelim"
+                        )
+                    else:
+                        moders_status_text = "Moderators are <b>completely offline</b> (>45m)" if moders_45_ready else "Moderators are <b>offline</b>"
+                        await broadcast(
+                            f"👑 <code>{OWNER_NICKNAME}</code> is <b>offline</b> (Preliminary), {moders_status_text}.",
+                            "notify_prelim"
+                        )
+                else:
+                    # Обычные изменения модераторов или смешанные статусы
+                    if not curr_owner and curr_moders_count > 0:
+                        await broadcast(
+                            f"👑 <code>{OWNER_NICKNAME}</code> is <b>offline</b> (Preliminary).\n🛡️ {mod_names_str}.",
+                            "notify_prelim"
+                        )
+                    elif curr_owner and curr_moders_count == 0:
+                        moders_status_text = "Moderators are <b>completely offline</b> (>45m)" if moders_45_ready else "Moderators are <b>offline</b>"
+                        await broadcast(
+                            f"👑 <code>{OWNER_NICKNAME}</code> is <b>online</b>, {moders_status_text}.",
+                            "notify_prelim"
+                        )
+                    elif curr_owner and curr_moders_count > 0:
+                        await broadcast(
+                            f"👑 <code>{OWNER_NICKNAME}</code> is <b>online</b>.\n🛡️ {mod_names_str}.",
+                            "notify_prelim"
+                        )
+                    elif not curr_owner and curr_moders_count == 0:
+                        moders_status_text = "Moderators are <b>completely offline</b> (>45m)" if moders_45_ready else "Moderators are <b>offline</b>"
+                        await broadcast(
+                            f"👑 <code>{OWNER_NICKNAME}</code> is <b>offline</b> (Preliminary), {moders_status_text}.",
+                            "notify_prelim"
+                        )
+
+            owner_online = curr_owner
+            moders_count = curr_moders_count
 
             if owner_45_ready and moders_45_ready and (not owner_45_notified or not moders_45_notified):
                 await broadcast(
