@@ -39,6 +39,7 @@ server = JavaServer.lookup(SERVER_HOST)
 current_status_cache = {
     "total_players": 0,
     "owner_online": False,
+    "owner_completely_offline": False,
     "online_moders": [],
     "all_players": [],
     "is_down": False
@@ -58,6 +59,16 @@ def save_users(users: set):
             f.write(f"{uid}\n")
 
 
+def default_user_settings() -> dict:
+    return {
+        "notify_hourly": True,
+        "notify_prelim": True,
+        "show_owner": True,
+        "show_moders": True,
+        "show_players": True
+    }
+
+
 def register_user_if_new(user_id: int):
     """Registers user on first interaction with default notifications enabled."""
     users = load_users()
@@ -66,12 +77,7 @@ def register_user_if_new(user_id: int):
         save_users(users)
         settings_data = load_all_user_settings()
         if str(user_id) not in settings_data:
-            settings_data[str(user_id)] = {
-                "broadcast": True,
-                "show_owner": True,
-                "show_moders": True,
-                "show_players": True
-            }
+            settings_data[str(user_id)] = default_user_settings()
             save_all_user_settings(settings_data)
 
 
@@ -92,26 +98,22 @@ def save_all_user_settings(data: dict):
 
 def get_user_settings(user_id: int) -> dict:
     all_settings = load_all_user_settings()
-    return all_settings.get(str(user_id), {
-        "broadcast": True, 
-        "show_owner": True,
-        "show_moders": True,
-        "show_players": True
-    })
+    cfg = all_settings.get(str(user_id), default_user_settings())
+    # Ensure backwards compatibility if older settings file exists
+    defaults = default_user_settings()
+    for k, v in defaults.items():
+        if k not in cfg:
+            cfg[k] = v
+    return cfg
 
 
-async def broadcast(text: str):
-    """Broadcasts a message only to users who have auto notifications enabled."""
+async def broadcast(text: str, setting_key: str):
+    """Broadcasts a message only to users who have the specified notification setting enabled."""
     settings_data = load_all_user_settings()
     users = load_users()
     for user_id in users:
-        user_cfg = settings_data.get(str(user_id), {
-            "broadcast": True, 
-            "show_owner": True,
-            "show_moders": True,
-            "show_players": True
-        })
-        if not user_cfg.get("broadcast", True):
+        user_cfg = settings_data.get(str(user_id), default_user_settings())
+        if not user_cfg.get(setting_key, True):
             continue
         try:
             await bot.send_message(chat_id=user_id, text=text, parse_mode="HTML")
@@ -132,7 +134,13 @@ def get_status_text_for_user(user_id: int) -> str:
     utc_now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     lines = [f"📊 <b>SERVER STATUS</b>\n<code>{utc_now}</code>\n"]
 
-    owner_status = "🟢 <b>Online</b>" if st["owner_online"] else "🔴 <b>Offline</b>"
+    if st["owner_online"]:
+        owner_status = "🟢 <b>Online</b>"
+    elif st.get("owner_completely_offline", False):
+        owner_status = "🔴 <b>Completely offline</b>"
+    else:
+        owner_status = "🔴 <b>Offline</b>"
+
     owner_str = f"👑 <b>Owner:</b> <code>{OWNER_NICKNAME}</code> — {owner_status}"
 
     moders_list = st["online_moders"]
@@ -173,7 +181,8 @@ def get_status_text_for_user(user_id: int) -> str:
 def get_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
     settings = get_user_settings(user_id)
     
-    b_check = "✅" if settings.get("broadcast", True) else "❌"
+    hourly_check = "✅" if settings.get("notify_hourly", True) else "❌"
+    prelim_check = "✅" if settings.get("notify_prelim", True) else "❌"
     owner_check = "✅" if settings.get("show_owner", True) else "❌"
     moders_check = "✅" if settings.get("show_moders", True) else "❌"
     players_check = "✅" if settings.get("show_players", True) else "❌"
@@ -182,7 +191,8 @@ def get_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"{owner_check} Show Owner", callback_data="toggle_owner")],
         [InlineKeyboardButton(text=f"{moders_check} Show Moderators", callback_data="toggle_moders")],
         [InlineKeyboardButton(text=f"{players_check} Show Players", callback_data="toggle_players")],
-        [InlineKeyboardButton(text=f"{b_check} Auto Notifications", callback_data="toggle_broadcast")],
+        [InlineKeyboardButton(text=f"{hourly_check} Hourly Updates", callback_data="toggle_hourly")],
+        [InlineKeyboardButton(text=f"{prelim_check} Preliminary Alerts", callback_data="toggle_prelim")],
         [InlineKeyboardButton(text="🔄 Refresh Status", callback_data="refresh_settings_status")],
         [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu")]
     ]
@@ -211,7 +221,7 @@ def get_main_menu_text() -> str:
         "<b>Commands:</b>\n"
         " /status — get current server state\n"
         " /settings — configure display toggles & notifications\n"
-        " /stop — disable auto notifications"
+        " /stop — disable all auto notifications"
     )
 
 
@@ -228,14 +238,15 @@ async def cmd_settings(message: Message):
 
     await message.answer(
         "⚙️ <b>Bot Settings & Preferences</b>\n\n"
-        "Use the toggle buttons below to choose what information you want to see and manage auto notifications.",
+        "Use the toggle buttons below to choose what information you want to see and manage notifications.",
         reply_markup=get_settings_keyboard(user_id),
         parse_mode="HTML"
     )
 
 
 @dp.callback_query(lambda c: c.data in [
-    "toggle_owner", "toggle_moders", "toggle_players", "toggle_broadcast", 
+    "toggle_owner", "toggle_moders", "toggle_players", 
+    "toggle_hourly", "toggle_prelim",
     "refresh_settings_status", "refresh_status", "open_settings", "main_menu"
 ])
 async def process_callback(callback: CallbackQuery):
@@ -254,7 +265,7 @@ async def process_callback(callback: CallbackQuery):
         try:
             await callback.message.edit_text(
                 "⚙️ <b>Bot Settings & Preferences</b>\n\n"
-                "Use the toggle buttons below to choose what information you want to see and manage auto notifications.",
+                "Use the toggle buttons below to choose what information you want to see and manage notifications.",
                 reply_markup=get_settings_keyboard(user_id),
                 parse_mode="HTML"
             )
@@ -279,12 +290,7 @@ async def process_callback(callback: CallbackQuery):
         return
 
     settings_data = load_all_user_settings()
-    user_cfg = settings_data.get(str(user_id), {
-        "broadcast": True, 
-        "show_owner": True,
-        "show_moders": True,
-        "show_players": True
-    })
+    user_cfg = get_user_settings(user_id)
 
     if callback.data == "toggle_owner":
         user_cfg["show_owner"] = not user_cfg.get("show_owner", True)
@@ -292,8 +298,10 @@ async def process_callback(callback: CallbackQuery):
         user_cfg["show_moders"] = not user_cfg.get("show_moders", True)
     elif callback.data == "toggle_players":
         user_cfg["show_players"] = not user_cfg.get("show_players", True)
-    elif callback.data == "toggle_broadcast":
-        user_cfg["broadcast"] = not user_cfg.get("broadcast", True)
+    elif callback.data == "toggle_hourly":
+        user_cfg["notify_hourly"] = not user_cfg.get("notify_hourly", True)
+    elif callback.data == "toggle_prelim":
+        user_cfg["notify_prelim"] = not user_cfg.get("notify_prelim", True)
     elif callback.data == "refresh_settings_status":
         if current_status_cache["is_down"]:
             await callback.answer("Server is currently down!", show_alert=True)
@@ -325,18 +333,14 @@ async def cmd_stop(message: Message):
     register_user_if_new(user_id)
 
     settings_data = load_all_user_settings()
-    user_cfg = settings_data.get(str(user_id), {
-        "broadcast": True,
-        "show_owner": True,
-        "show_moders": True,
-        "show_players": True
-    })
-    user_cfg["broadcast"] = False
+    user_cfg = get_user_settings(user_id)
+    user_cfg["notify_hourly"] = False
+    user_cfg["notify_prelim"] = False
     settings_data[str(user_id)] = user_cfg
     save_all_user_settings(settings_data)
 
     await message.answer(
-        "🔕 <b>Auto notifications disabled.</b> You can turn them back on in /settings.",
+        "🔕 <b>All notifications disabled.</b> You can turn them back on in /settings.",
         reply_markup=get_stop_keyboard(),
         parse_mode="HTML"
     )
@@ -399,7 +403,7 @@ async def monitor_loop():
             current_status_cache["online_moders"] = curr_moders_list
             current_status_cache["all_players"] = all_player_names
 
-            # Hourly report at exact 00 minutes (skipped on very first iteration if owner_online is None)
+            # Hourly report at exact 00 minutes
             if owner_online is not None and current_minute == 0 and last_reported_hour != current_hour:
                 formatted_time = now_time_utc.strftime('%H:00')
                 
@@ -423,7 +427,7 @@ async def monitor_loop():
                     f"{players_line}"
                 )
 
-                await broadcast(hourly_text)
+                await broadcast(hourly_text, "notify_hourly")
                 last_reported_hour = current_hour
             elif current_minute != 0:
                 last_reported_hour = -1
@@ -441,15 +445,14 @@ async def monitor_loop():
 
             current_timestamp = time.time()
 
-            # Owner online / offline state changes
+            # Track timestamps for 45-minute offline checks
             if curr_owner and not owner_online:
-                await broadcast(f"👑 <code>{OWNER_NICKNAME}</code> is <b>online</b>.")
                 owner_45_notified = False
-
+                current_status_cache["owner_completely_offline"] = False
             elif not curr_owner and owner_online:
-                await broadcast(f"👑 <code>{OWNER_NICKNAME}</code> is <b>offline</b>. (Preliminary)")
                 owner_last_seen = current_timestamp
                 owner_45_notified = False
+                current_status_cache["owner_completely_offline"] = False
 
             if curr_moders_count == 0 and moders_count > 0:
                 moders_last_seen = current_timestamp
@@ -457,21 +460,30 @@ async def monitor_loop():
             elif curr_moders_count > 0:
                 moders_45_notified = False
 
-            mod_names_str = f"Moderators online: {', '.join(f'<code>{m}</code>' for m in curr_moders_list)}" if curr_moders_list else "No moderators online"
-
+            # Unified staff state change notification (prevents duplicate Preliminary alerts)
             if (curr_owner != owner_online) or (curr_moders_count != moders_count):
+                mod_names_str = f"Moderators online: {', '.join(f'<code>{m}</code>' for m in curr_moders_list)}"
+
                 if not curr_owner and curr_moders_count > 0:
                     await broadcast(
-                        f"👑 <code>{OWNER_NICKNAME}</code> is <b>offline</b> (Prelim.).\n🛡️ {mod_names_str}."
+                        f"👑 <code>{OWNER_NICKNAME}</code> is <b>offline</b> (Preliminary).\n🛡️ {mod_names_str}.",
+                        "notify_prelim"
                     )
                 elif curr_owner and curr_moders_count == 0:
-                    await broadcast(f"👑 <code>{OWNER_NICKNAME}</code> is <b>online</b>, No moderators online.")
+                    await broadcast(
+                        f"👑 <code>{OWNER_NICKNAME}</code> is <b>online</b>, Moderators are <b>offline</b>.",
+                        "notify_prelim"
+                    )
                 elif curr_owner and curr_moders_count > 0:
                     await broadcast(
-                        f"👑 <code>{OWNER_NICKNAME}</code> is <b>online</b>.\n🛡️ {mod_names_str}."
+                        f"👑 <code>{OWNER_NICKNAME}</code> is <b>online</b>.\n🛡️ {mod_names_str}.",
+                        "notify_prelim"
                     )
                 elif not curr_owner and curr_moders_count == 0:
-                    await broadcast(f"👑 <code>{OWNER_NICKNAME}</code> is <b>offline</b> (Prelim.), Moderators are offline.")
+                    await broadcast(
+                        f"👑 <code>{OWNER_NICKNAME}</code> is <b>offline</b> (Preliminary), Moderators are <b>offline</b>.",
+                        "notify_prelim"
+                    )
 
             owner_online = curr_owner
             moders_count = curr_moders_count
@@ -488,15 +500,22 @@ async def monitor_loop():
                 and (current_timestamp - moders_last_seen >= OFFLINE_TIMEOUT)
             )
 
+            if owner_45_ready:
+                current_status_cache["owner_completely_offline"] = True
+
             if owner_45_ready and moders_45_ready and (not owner_45_notified or not moders_45_notified):
                 await broadcast(
-                    f"<b><i><code>{OWNER_NICKNAME} is completely offline. Moderators are completely offline.</code></i></b>"
+                    f"<b><i><code>{OWNER_NICKNAME} is completely offline. Moderators are completely offline.</code></i></b>",
+                    "notify_prelim"
                 )
                 owner_45_notified = True
                 moders_45_notified = True
 
             elif owner_45_ready and not owner_45_notified:
-                await broadcast(f"👑 <code>{OWNER_NICKNAME}</code> is <b>completely offline</b>.")
+                await broadcast(
+                    f"👑 <code>{OWNER_NICKNAME}</code> is <b>completely offline</b>.",
+                    "notify_prelim"
+                )
                 owner_45_notified = True
 
         except Exception as e:
