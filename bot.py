@@ -663,6 +663,8 @@ async def monitor_loop():
     moders_count = None
     moders_last_seen = None
     moders_45_notified = False
+    
+    server_down_notified = False
 
     last_reported_hour = -1
     owner_lower = OWNER_NICKNAME.lower()
@@ -677,6 +679,7 @@ async def monitor_loop():
             current_status_cache["is_down"] = False
             current_status_cache["last_error"] = None
             current_status_cache["ping"] = round(status.latency)
+            server_down_notified = False
 
             sample_players = status.players.sample if status.players.sample else []
             online_names_lower = {p.name.lower() for p in sample_players}
@@ -791,6 +794,15 @@ async def monitor_loop():
             current_status_cache["is_down"] = True
             current_status_cache["last_error"] = str(e)
             print(f"[Server unavailable]: {e}")
+
+            if not server_down_notified:
+                await broadcast(
+                    f"🚨 <b>CRITICAL STATUS UPDATE</b>\n\n"
+                    f"⚠️ <b>Server is currently unavailable!</b>\n"
+                    f"Error: <code>{e}</code>",
+                    "notify_prelim"
+                )
+                server_down_notified = True
 
         await asyncio.sleep(CHECK_INTERVAL)
 
