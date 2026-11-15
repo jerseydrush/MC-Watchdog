@@ -810,21 +810,28 @@ async def monitor_loop():
 async def main():
     print("MC Watchdog (Telegram + Discord) is running...")
     monitor_task = asyncio.create_task(monitor_loop())
+    service_tasks = [
+        asyncio.create_task(dp.start_polling(tg_bot)),
+        asyncio.create_task(dc_client.start(DISCORD_TOKEN)),
+    ]
+
     try:
-        await asyncio.gather(
-            dp.start_polling(tg_bot),
-            dc_client.start(DISCORD_TOKEN)
+        done, _ = await asyncio.wait(
+            service_tasks,
+            return_when=asyncio.FIRST_COMPLETED
         )
-    except (asyncio.CancelledError, KeyboardInterrupt):
-        pass
+        for task in done:
+            task.result()
     finally:
-        monitor_task.cancel()
-        await dc_client.close()
+        for task in [*service_tasks, monitor_task]:
+            task.cancel()
+        await asyncio.gather(*service_tasks, monitor_task, return_exceptions=True)
         await tg_bot.session.close()
+        await dc_client.close()
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Bot stopped.")
+    except (KeyboardInterrupt, SystemExit):
+        pass
