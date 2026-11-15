@@ -831,7 +831,7 @@ async def monitor_loop():
 
         except Exception as e:
             current_status_cache["is_down"] = True
-            err_text = str(e).strip() or "Connection failed / Unknown error"
+            err_text = type(e).__name__ if not str(e).strip() else f"{type(e).__name__}: {e}"
             err_text = err_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             current_status_cache["last_error"] = err_text
             print(f"[Server unavailable]: {e}")
