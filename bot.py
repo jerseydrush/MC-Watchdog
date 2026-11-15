@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import os
 import json
 from aiogram import Bot, Dispatcher
@@ -61,6 +61,7 @@ def save_users(users: set):
 
 def default_user_settings() -> dict:
     return {
+        "timezone_offset": 0,  # UTC offset in hours (-12 to +14)
         "notify_hourly": True,
         "notify_prelim": True,
         "show_owner": True,
@@ -70,7 +71,7 @@ def default_user_settings() -> dict:
 
 
 def register_user_if_new(user_id: int):
-    """Registers user on first interaction with default notifications enabled."""
+    """Registers user on first interaction with default settings enabled."""
     users = load_users()
     if user_id not in users:
         users.add(user_id)
@@ -99,7 +100,6 @@ def save_all_user_settings(data: dict):
 def get_user_settings(user_id: int) -> dict:
     all_settings = load_all_user_settings()
     cfg = all_settings.get(str(user_id), default_user_settings())
-    # Ensure backwards compatibility if older settings file exists
     defaults = default_user_settings()
     for k, v in defaults.items():
         if k not in cfg:
@@ -107,16 +107,38 @@ def get_user_settings(user_id: int) -> dict:
     return cfg
 
 
-async def broadcast(text: str, setting_key: str):
-    """Broadcasts a message only to users who have the specified notification setting enabled."""
+def get_user_time_str(user_id: int, dt: datetime = None) -> str:
+    if dt is None:
+        dt = datetime.now(timezone.utc)
+    settings = get_user_settings(user_id)
+    offset_hours = settings.get("timezone_offset", 0)
+    user_tz = timezone(timedelta(hours=offset_hours))
+    return dt.astimezone(user_tz).strftime("%Y-%m-%d %H:%M:%S")
+
+
+async def broadcast(text_template: str, setting_key: str, is_hourly: bool = False):
+    """Broadcasts a message to users, formatting time according to each user's timezone offset."""
     settings_data = load_all_user_settings()
     users = load_users()
+    
+    utc_now = datetime.now(timezone.utc)
+    
     for user_id in users:
         user_cfg = settings_data.get(str(user_id), default_user_settings())
         if not user_cfg.get(setting_key, True):
             continue
         try:
-            await bot.send_message(chat_id=user_id, text=text, parse_mode="HTML")
+            if is_hourly:
+                offset_hours = user_cfg.get("timezone_offset", 0)
+                user_tz = timezone(timedelta(hours=offset_hours))
+                user_time = utc_now.astimezone(user_tz)
+                formatted_time = user_time.strftime('%H:00')
+                
+                # Replace time placeholder in hourly update text for this specific user
+                personalized_text = text_template.replace("{TIME_PLACEHOLDER}", formatted_time)
+                await bot.send_message(chat_id=user_id, text=personalized_text, parse_mode="HTML")
+            else:
+                await bot.send_message(chat_id=user_id, text=text_template, parse_mode="HTML")
         except Exception as e:
             print(f"[Broadcast error to {user_id}]: {e}")
 
@@ -131,8 +153,8 @@ def get_status_text_for_user(user_id: int) -> str:
     show_moders = settings.get("show_moders", True)
     show_players = settings.get("show_players", True)
 
-    utc_now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    lines = [f"📊 <b>SERVER STATUS</b>\n<code>{utc_now}</code>\n"]
+    time_str = get_user_time_str(user_id)
+    lines = [f"📊 <b>SERVER STATUS</b>\n<code>{time_str}</code>\n"]
 
     if st["owner_online"]:
         owner_status = "🟢 <b>Online</b>"
@@ -181,6 +203,10 @@ def get_status_text_for_user(user_id: int) -> str:
 def get_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
     settings = get_user_settings(user_id)
     
+    offset = settings.get("timezone_offset", 0)
+    offset_sign = "+" if offset >= 0 else ""
+    tz_text = f"🌐 Timezone: UTC {offset_sign}{offset}"
+
     hourly_check = "✅" if settings.get("notify_hourly", True) else "❌"
     prelim_check = "✅" if settings.get("notify_prelim", True) else "❌"
     owner_check = "✅" if settings.get("show_owner", True) else "❌"
@@ -193,10 +219,34 @@ def get_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"{players_check} Show Players", callback_data="toggle_players")],
         [InlineKeyboardButton(text=f"{hourly_check} Hourly Updates", callback_data="toggle_hourly")],
         [InlineKeyboardButton(text=f"{prelim_check} Preliminary Alerts", callback_data="toggle_prelim")],
+        [InlineKeyboardButton(text=tz_text, callback_data="open_tz_menu")],
         [InlineKeyboardButton(text="🔄 Refresh Status", callback_data="refresh_settings_status")],
         [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def get_timezone_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    settings = get_user_settings(user_id)
+    current_offset = settings.get("timezone_offset", 0)
+
+    rows = []
+    row = []
+    for offset in range(-12, 15):
+        sign = "+" if offset >= 0 else ""
+        label = f"UTC {sign}{offset}"
+        if offset == current_offset:
+            label = f"✅ {label}"
+        
+        row.append(InlineKeyboardButton(text=label, callback_data=f"set_tz_{offset}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+
+    rows.append([InlineKeyboardButton(text="⬅️ Back to Settings", callback_data="open_settings")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def get_status_keyboard() -> InlineKeyboardMarkup:
@@ -238,7 +288,7 @@ async def cmd_settings(message: Message):
 
     await message.answer(
         "⚙️ <b>Bot Settings & Preferences</b>\n\n"
-        "Use the toggle buttons below to choose what information you want to see and manage notifications.",
+        "Use the toggle buttons below to choose what information you want to see, manage notifications, and set your timezone.",
         reply_markup=get_settings_keyboard(user_id),
         parse_mode="HTML"
     )
@@ -246,9 +296,9 @@ async def cmd_settings(message: Message):
 
 @dp.callback_query(lambda c: c.data in [
     "toggle_owner", "toggle_moders", "toggle_players", 
-    "toggle_hourly", "toggle_prelim",
+    "toggle_hourly", "toggle_prelim", "open_tz_menu",
     "refresh_settings_status", "refresh_status", "open_settings", "main_menu"
-])
+] or c.data.startswith("set_tz_"))
 async def process_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
     register_user_if_new(user_id)
@@ -265,13 +315,47 @@ async def process_callback(callback: CallbackQuery):
         try:
             await callback.message.edit_text(
                 "⚙️ <b>Bot Settings & Preferences</b>\n\n"
-                "Use the toggle buttons below to choose what information you want to see and manage notifications.",
+                "Use the toggle buttons below to choose what information you want to see, manage notifications, and set your timezone.",
                 reply_markup=get_settings_keyboard(user_id),
                 parse_mode="HTML"
             )
         except Exception:
             pass
         await callback.answer()
+        return
+
+    if callback.data == "open_tz_menu":
+        try:
+            await callback.message.edit_text(
+                "🌐 <b>Select your Timezone</b>\n\n"
+                "Choose your offset relative to UTC:",
+                reply_markup=get_timezone_keyboard(user_id),
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+        await callback.answer()
+        return
+
+    if callback.data.startswith("set_tz_"):
+        try:
+            offset_val = int(callback.data.split("_")[2])
+            settings_data = load_all_user_settings()
+            user_cfg = get_user_settings(user_id)
+            user_cfg["timezone_offset"] = offset_val
+            settings_data[str(user_id)] = user_cfg
+            save_all_user_settings(settings_data)
+
+            sign = "+" if offset_val >= 0 else ""
+            await callback.message.edit_text(
+                "🌐 <b>Select your Timezone</b>\n\n"
+                f"Timezone successfully set to <b>UTC {sign}{offset_val}</b>!",
+                reply_markup=get_timezone_keyboard(user_id),
+                parse_mode="HTML"
+            )
+            await callback.answer(f"Timezone updated to UTC {sign}{offset_val}")
+        except Exception as e:
+            await callback.answer("Failed to update timezone.", show_alert=True)
         return
 
     if callback.data == "refresh_status":
@@ -405,8 +489,6 @@ async def monitor_loop():
 
             # Hourly report at exact 00 minutes
             if owner_online is not None and current_minute == 0 and last_reported_hour != current_hour:
-                formatted_time = now_time_utc.strftime('%H:00')
-                
                 owner_status_str = "🟢 <b>Online</b>" if curr_owner else "🔴 <b>Offline</b>"
                 owner_line = f"👑 <b>Owner:</b> <code>{OWNER_NICKNAME}</code> — {owner_status_str}"
                 
@@ -420,14 +502,14 @@ async def monitor_loop():
                 else:
                     players_line = f"👥 <b>Players online:</b> <code>{total_players}</code> (<i>No sample</i>)"
 
-                hourly_text = (
-                    f"📈 <b>Hourly update</b> ({formatted_time}) — Players online: <code>{total_players}</code>\n\n"
+                hourly_text_template = (
+                    f"📈 <b>Hourly update</b> ({{TIME_PLACEHOLDER}}) — Players online: <code>{total_players}</code>\n\n"
                     f"{owner_line}\n\n"
                     f"{moders_line}\n\n"
                     f"{players_line}"
                 )
 
-                await broadcast(hourly_text, "notify_hourly")
+                await broadcast(hourly_text_template, "notify_hourly", is_hourly=True)
                 last_reported_hour = current_hour
             elif current_minute != 0:
                 last_reported_hour = -1
