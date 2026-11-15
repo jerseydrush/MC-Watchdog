@@ -792,14 +792,16 @@ async def monitor_loop():
 
         except Exception as e:
             current_status_cache["is_down"] = True
-            current_status_cache["last_error"] = str(e)
+            err_text = str(e).strip() or "Connection failed / Unknown error"
+            err_text = err_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            current_status_cache["last_error"] = err_text
             print(f"[Server unavailable]: {e}")
 
             if not server_down_notified:
                 await broadcast(
                     f"🚨 <b>CRITICAL STATUS UPDATE</b>\n\n"
                     f"⚠️ <b>Server is down!</b>\n"
-                    f"Error: <code>{e}</code>",
+                    f"Error: <code>{err_text}</code>",
                     "notify_prelim"
                 )
                 server_down_notified = True
@@ -835,3 +837,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+    finally:
+        os._exit(0)
