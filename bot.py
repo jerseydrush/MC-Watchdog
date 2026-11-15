@@ -498,7 +498,7 @@ async def tg_cmd_status(message: Message):
         err_msg = current_status_cache.get("last_error")
         err_details = f"\n<code>{err_msg}</code>" if err_msg else ""
         await message.answer(
-            f"⚠️ <b>Server is unavailable</b>, please try again later.{err_details}",
+            f"⚠️ <b>Server is currently unavailable.</b>{err_details}",
             reply_markup=get_tg_status_keyboard(),
             parse_mode="HTML"
         )
@@ -798,7 +798,7 @@ async def monitor_loop():
             if not server_down_notified:
                 await broadcast(
                     f"🚨 <b>CRITICAL STATUS UPDATE</b>\n\n"
-                    f"⚠️ <b>Server is currently unavailable!</b>\n"
+                    f"⚠️ <b>Server is down!</b>\n"
                     f"Error: <code>{e}</code>",
                     "notify_prelim"
                 )
