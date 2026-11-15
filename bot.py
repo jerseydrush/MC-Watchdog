@@ -42,7 +42,9 @@ current_status_cache = {
     "owner_completely_offline": False,
     "online_moders": [],
     "all_players": [],
-    "is_down": False
+    "is_down": False,
+    "ping": None,
+    "last_error": None
 }
 
 
@@ -134,7 +136,6 @@ async def broadcast(text_template: str, setting_key: str, is_hourly: bool = Fals
                 user_time = utc_now.astimezone(user_tz)
                 formatted_time = user_time.strftime('%H:00')
                 
-                # Replace time placeholder in hourly update text for this specific user
                 personalized_text = text_template.replace("{TIME_PLACEHOLDER}", formatted_time)
                 await bot.send_message(chat_id=user_id, text=personalized_text, parse_mode="HTML")
             else:
@@ -146,7 +147,9 @@ async def broadcast(text_template: str, setting_key: str, is_hourly: bool = Fals
 def get_status_text_for_user(user_id: int) -> str:
     st = current_status_cache
     if st["is_down"]:
-        return "⚠️ <b>Server is currently unavailable.</b>"
+        err_msg = st.get("last_error")
+        err_details = f"\n<code>{err_msg}</code>" if err_msg else ""
+        return f"⚠️ <b>Server is currently unavailable.</b>{err_details}"
 
     settings = get_user_settings(user_id)
     show_owner = settings.get("show_owner", True)
@@ -154,7 +157,10 @@ def get_status_text_for_user(user_id: int) -> str:
     show_players = settings.get("show_players", True)
 
     time_str = get_user_time_str(user_id)
-    lines = [f"📊 <b>SERVER STATUS</b>\n<code>{time_str}</code>\n"]
+    ping_val = st.get("ping")
+    ping_str = f" | 🏓 <code>{ping_val}ms</code>" if ping_val is not None else ""
+    
+    lines = [f"📊 <b>SERVER STATUS</b>{ping_str}\n<code>{time_str}</code>\n"]
 
     if st["owner_online"]:
         owner_status = "🟢 <b>Online</b>"
@@ -360,7 +366,9 @@ async def process_callback(callback: CallbackQuery):
 
     if callback.data == "refresh_status":
         if current_status_cache["is_down"]:
-            await callback.answer("Server is currently down!", show_alert=True)
+            err_msg = current_status_cache.get("last_error")
+            alert_text = f"Server is currently down!\nError: {err_msg}" if err_msg else "Server is currently down!"
+            await callback.answer(alert_text, show_alert=True)
             return
         try:
             await callback.message.edit_text(
@@ -388,7 +396,9 @@ async def process_callback(callback: CallbackQuery):
         user_cfg["notify_prelim"] = not user_cfg.get("notify_prelim", True)
     elif callback.data == "refresh_settings_status":
         if current_status_cache["is_down"]:
-            await callback.answer("Server is currently down!", show_alert=True)
+            err_msg = current_status_cache.get("last_error")
+            alert_text = f"Server is currently down!\nError: {err_msg}" if err_msg else "Server is currently down!"
+            await callback.answer(alert_text, show_alert=True)
             return
         try:
             await callback.message.edit_text(
@@ -436,8 +446,10 @@ async def cmd_status(message: Message):
     register_user_if_new(user_id)
 
     if current_status_cache["is_down"]:
+        err_msg = current_status_cache.get("last_error")
+        err_details = f"\n<code>{err_msg}</code>" if err_msg else ""
         await message.answer(
-            "⚠️ <b>Server is unavailable</b>, please try again later.", 
+            f"⚠️ <b>Server is unavailable</b>, please try again later.{err_details}", 
             reply_markup=get_status_keyboard(),
             parse_mode="HTML"
         )
@@ -471,6 +483,8 @@ async def monitor_loop():
         try:
             status = await server.async_status()
             current_status_cache["is_down"] = False
+            current_status_cache["last_error"] = None
+            current_status_cache["ping"] = round(status.latency)
 
             sample_players = status.players.sample if status.players.sample else []
             online_names_lower = {p.name.lower() for p in sample_players}
@@ -502,8 +516,11 @@ async def monitor_loop():
                 else:
                     players_line = f"👥 <b>Players online:</b> <code>{total_players}</code> (<i>No sample</i>)"
 
+                ping_val = current_status_cache.get("ping")
+                ping_str = f" | 🏓 <code>{ping_val}ms</code>" if ping_val is not None else ""
+
                 hourly_text_template = (
-                    f"📈 <b>Hourly update</b> ({{TIME_PLACEHOLDER}}) — Players online: <code>{total_players}</code>\n\n"
+                    f"📈 <b>Hourly update</b> ({{TIME_PLACEHOLDER}}){ping_str} — Players online: <code>{total_players}</code>\n\n"
                     f"{owner_line}\n\n"
                     f"{moders_line}\n\n"
                     f"{players_line}"
@@ -587,7 +604,9 @@ async def monitor_loop():
 
             if owner_45_ready and moders_45_ready and (not owner_45_notified or not moders_45_notified):
                 await broadcast(
-                    f"<b><i><code>{OWNER_NICKNAME} is completely offline. Moderators are completely offline.</code></i></b>",
+                    f"🚨 <b>CRITICAL STATUS UPDATE</b>\n\n"
+                    f"❌ <code>{OWNER_NICKNAME}</code> is <b>completely offline</b> (>45m).\n"
+                    f"❌ <b>All Moderators</b> are <b>completely offline</b> (>45m).",
                     "notify_prelim"
                 )
                 owner_45_notified = True
@@ -595,13 +614,15 @@ async def monitor_loop():
 
             elif owner_45_ready and not owner_45_notified:
                 await broadcast(
-                    f"👑 <code>{OWNER_NICKNAME}</code> is <b>completely offline</b>.",
+                    f"⚠️ <b>STATUS UPDATE</b>\n\n"
+                    f"👑 <code>{OWNER_NICKNAME}</code> is now <b>completely offline</b> (>45m).",
                     "notify_prelim"
                 )
                 owner_45_notified = True
 
         except Exception as e:
             current_status_cache["is_down"] = True
+            current_status_cache["last_error"] = str(e)
             print(f"[Server unavailable]: {e}")
 
         await asyncio.sleep(CHECK_INTERVAL)
