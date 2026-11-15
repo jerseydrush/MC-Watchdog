@@ -22,7 +22,7 @@ An asynchronous cross-platform bot built with `aiogram 3`, `discord.py`, and `mc
   * Instant alerts when the server goes down or staff members join/leave.
 - **Hourly Statistics (`Hourly update`):**
   * Automatic broadcast at the top of every hour (`00` minutes), formatted in each user's personal timezone.
-  * Includes ping, total player count, owner status, list of online moderators, and all online player nicknames.
+  * Includes ping, total player count, owner status, online moderator list, and player nicknames (complete when Query is enabled on the server).
 - **Interactive Commands & Settings:**
   * `/start` — register in the bot and open the welcome menu.
   * `/status` — view current server state with a local timestamp and an interactive refresh button.
@@ -54,8 +54,9 @@ DISCORD_TOKEN=your_token_from_Discord_Developer_Portal
 SERVER_HOST=your_server_address
 OWNER_NICKNAME=owner_nickname
 MODERATORS=moder1,moder2,moder3
+# QUERY_PORT=25565
 ```
-*Note: List `MODERATORS` separated by commas without spaces (original letter casing is preserved in bot messages). For Discord DM notifications to work, users must share at least one server with the bot and allow DMs from server members.*
+*Note: List `MODERATORS` separated by commas without spaces (original letter casing is preserved in bot messages). To retrieve a complete player list, set `enable-query=true` in the Minecraft server's `server.properties` and allow UDP traffic to its query port. Set `QUERY_PORT` above if that port differs from the port in `SERVER_HOST`. Without Query access, the bot falls back to the sample provided by the status response and marks an incomplete list. For Discord DM notifications to work, users must share at least one server with the bot and allow DMs from server members.*
 
 #### 4. Run the Bot
 Start the main script:
@@ -96,7 +97,7 @@ python bot.py
   * Мгновенные оповещения при изменении статуса администрации или недоступности сервера.
 - **Ежечасная статистика (`Hourly update`):**
   * Автоматическая рассылка в начале каждого часа (`00` минут) с локальным временем каждого пользователя.
-  * Включает пинг, количество игроков, статус владельца, список модераторов и ники всех игроков онлайн.
+  * Включает пинг, количество игроков, статус владельца, список модераторов и ники игроков онлайн (полный список доступен при включенном Query на сервере).
 - **Интерактивные команды и настройки:**
   * `/start` — регистрация в боте и открытие главного меню.
   * `/status` — текущий статус сервера с локальным временем и кнопкой быстрого обновления.
@@ -128,8 +129,9 @@ DISCORD_TOKEN=ваш_токен_из_Discord_Developer_Portal
 SERVER_HOST=адрес_вашего_сервера
 OWNER_NICKNAME=никнейм_владельца
 MODERATORS=moder1,moder2,moder3
+# QUERY_PORT=25565
 ```
-*Примечание: `MODERATORS` указываются через запятую без пробелов (регистр букв сохраняется при выводе). Чтобы бот мог отправлять личные уведомления в Discord, у пользователя должен быть хотя бы один общий сервер с ботом и включен прием ЛС от участников сервера.*
+*Примечание: `MODERATORS` указываются через запятую без пробелов (регистр букв сохраняется при выводе). Чтобы получать полный список игроков, установите `enable-query=true` в `server.properties` Minecraft-сервера и разрешите UDP-трафик на Query-порт. Если он отличается от порта в `SERVER_HOST`, задайте `QUERY_PORT`. Без доступа к Query бот использует только список из ответа статуса и помечает его как неполный. Чтобы бот мог отправлять личные уведомления в Discord, у пользователя должен быть хотя бы один общий сервер с ботом и включен прием ЛС от участников сервера.*
 
 #### 4. Запуск бота
 Запустите главный скрипт:

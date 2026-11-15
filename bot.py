@@ -27,6 +27,7 @@ MODERATORS = [m.strip() for m in raw_mods.split(",") if m.strip()]
 
 CHECK_INTERVAL = 15
 OFFLINE_TIMEOUT = 45 * 60
+QUERY_RETRY_INTERVAL = 5 * 60
 USERS_FILE = "users.txt"
 SETTINGS_FILE = "user_settings.json"
 
@@ -46,6 +47,9 @@ dc_tree = app_commands.CommandTree(dc_client)
 
 # Automatically handles standard ports, custom ports, and DNS SRV records
 server = JavaServer.lookup(SERVER_HOST)
+query_port = os.getenv("QUERY_PORT")
+if query_port:
+    server.query_port = int(query_port)
 
 # Shared server status cache
 current_status_cache = {
@@ -54,6 +58,7 @@ current_status_cache = {
     "owner_completely_offline": False,
     "online_moders": [],
     "all_players": [],
+    "all_players_complete": True,
     "is_down": False,
     "ping": None,
     "last_error": None
@@ -223,8 +228,11 @@ def get_status_text_for_user(user_key: str) -> str:
         moders_str = "🛡️ <b>Moderators:</b> <i>None online</i>"
 
     all_players = st.get("all_players", [])
+    players_count = str(st["total_players"])
+    if not st.get("all_players_complete", True):
+        players_count += ", partial list"
     if all_players:
-        players_str = f"👥 <b>Players online ({st['total_players']}):</b>\n" + "\n".join(f"   ▪️ <code>{p}</code>" for p in all_players)
+        players_str = f"👥 <b>Players online ({players_count}):</b>\n" + "\n".join(f"   ▪️ <code>{p}</code>" for p in all_players)
     else:
         players_str = f"👥 <b>Players online:</b> <code>{st['total_players']}</code> (<i>No sample</i>)"
 
@@ -668,6 +676,7 @@ async def monitor_loop():
 
     last_reported_hour = -1
     owner_lower = OWNER_NICKNAME.lower()
+    query_retry_after = 0.0
 
     while True:
         now_time_utc = datetime.now(timezone.utc)
@@ -682,9 +691,35 @@ async def monitor_loop():
             server_down_notified = False
 
             sample_players = status.players.sample if status.players.sample else []
-            online_names_lower = {p.name.lower() for p in sample_players}
             all_player_names = [p.name for p in sample_players]
             total_players = status.players.online
+            players_list_complete = len(all_player_names) >= total_players
+
+            if not players_list_complete and time.monotonic() >= query_retry_after:
+                try:
+                    query_status = await server.async_query(tries=1)
+                    query_players = query_status.players
+                    query_names = getattr(query_players, "list", None)
+                    if query_names is None:
+                        query_names = getattr(query_players, "names", [])
+                    query_names = list(query_names)
+
+                    if query_status.players.online == 0 or query_names:
+                        all_player_names = query_names
+                        total_players = query_status.players.online
+                        players_list_complete = len(all_player_names) >= total_players
+                        query_retry_after = (
+                            0.0 if players_list_complete
+                            else time.monotonic() + QUERY_RETRY_INTERVAL
+                        )
+                    else:
+                        query_retry_after = time.monotonic() + QUERY_RETRY_INTERVAL
+                        print("[Player list query returned no names; using status sample]")
+                except (OSError, asyncio.TimeoutError) as e:
+                    query_retry_after = time.monotonic() + QUERY_RETRY_INTERVAL
+                    print(f"[Player list query unavailable; using status sample]: {e}")
+
+            online_names_lower = {name.lower() for name in all_player_names}
 
             curr_owner = owner_lower in online_names_lower
             curr_moders_list = [m for m in MODERATORS if m.lower() in online_names_lower]
@@ -695,6 +730,7 @@ async def monitor_loop():
             current_status_cache["owner_online"] = curr_owner
             current_status_cache["online_moders"] = curr_moders_list
             current_status_cache["all_players"] = all_player_names
+            current_status_cache["all_players_complete"] = players_list_complete
 
             # Hourly report at exact 00 minutes
             if owner_online is not None and current_minute == 0 and last_reported_hour != current_hour:
@@ -707,7 +743,10 @@ async def monitor_loop():
                     moders_line = "🛡️ <b>Moderators:</b> <i>None online</i>"
 
                 if all_player_names:
-                    players_line = f"👥 <b>Players online ({total_players}):</b>\n" + "\n".join(f"   ▪️ <code>{p}</code>" for p in all_player_names)
+                    players_count = str(total_players)
+                    if not players_list_complete:
+                        players_count += ", partial list"
+                    players_line = f"👥 <b>Players online ({players_count}):</b>\n" + "\n".join(f"   ▪️ <code>{p}</code>" for p in all_player_names)
                 else:
                     players_line = f"👥 <b>Players online:</b> <code>{total_players}</code> (<i>No sample</i>)"
 
