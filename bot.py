@@ -778,7 +778,7 @@ async def monitor_loop():
 
             current_timestamp = time.time()
 
-            # Track timestamps for 45-minute offline checks
+            # Track transitions for owner online/offline status
             if curr_owner and not owner_online:
                 owner_45_notified = False
                 current_status_cache["owner_completely_offline"] = False
@@ -787,10 +787,12 @@ async def monitor_loop():
                 owner_45_notified = False
                 current_status_cache["owner_completely_offline"] = False
 
-            if curr_moders_count == 0 and moders_count > 0:
-                moders_last_seen = current_timestamp
+            # Track transitions for moderators online/offline status
+            if curr_moders_count > 0 and moders_count == 0:
+                # Moderators came online — reset the 45-minute notification flag for moderators
                 moders_45_notified = False
-            elif curr_moders_count > 0:
+            elif curr_moders_count == 0 and moders_count > 0:
+                moders_last_seen = current_timestamp
                 moders_45_notified = False
 
             # 45-minute timeout checks
@@ -811,7 +813,8 @@ async def monitor_loop():
             owner_online = curr_owner
             moders_count = curr_moders_count
 
-            if owner_45_ready and moders_45_ready and (not owner_45_notified or not moders_45_notified):
+            # Send critical alert only if both are offline >45m and it hasn't been notified yet
+            if owner_45_ready and moders_45_ready and not (owner_45_notified and moders_45_notified):
                 await broadcast(
                     f"🚨 <b>CRITICAL STATUS UPDATE</b>\n\n"
                     f"❌ <code>{OWNER_NICKNAME}</code> is <b>completely offline</b> (>45m).\n"
