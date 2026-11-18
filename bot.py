@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 import re
+import sys
 import time
 
 from aiogram import Bot, Dispatcher
@@ -30,6 +31,10 @@ OFFLINE_TIMEOUT = 45 * 60
 QUERY_RETRY_INTERVAL = 5 * 60
 USERS_FILE = "users.txt"
 SETTINGS_FILE = "user_settings.json"
+STATS_FILE = "player_stats.json"
+
+# Конфиг для защиты от ложных таймаутов (подтверждение после N ошибок подряд)
+SERVER_DOWN_THRESHOLD = 3
 
 if not TG_TOKEN:
     raise ValueError("Error: TG_TOKEN not found in .env file!")
@@ -61,7 +66,9 @@ current_status_cache = {
     "all_players_complete": True,
     "is_down": False,
     "ping": None,
-    "last_error": None
+    "last_error": None,
+    "peak_today": 0,
+    "peak_time": None
 }
 
 
@@ -75,7 +82,6 @@ def load_users() -> set[str]:
             val = line.strip()
             if not val:
                 continue
-            # Migrate legacy numeric IDs to Telegram prefix automatically
             if val.isdigit():
                 users.add(f"tg_{val}")
             else:
@@ -91,7 +97,7 @@ def save_users(users: set[str]):
 
 def default_user_settings() -> dict:
     return {
-        "timezone_offset": 0,  # UTC offset in hours (-12 to +14)
+        "timezone_offset": 0,
         "notify_hourly": True,
         "notify_prelim": True,
         "show_owner": True,
@@ -120,8 +126,86 @@ def save_all_user_settings(data: dict):
         json.dump(data, f, indent=4)
 
 
+# ==========================================
+# STATS & PLAYER TRACKING SYSTEM (WITH 7-DAY ROTATION)
+# ==========================================
+
+def load_player_stats() -> dict:
+    if not os.path.exists(STATS_FILE):
+        return {"dates": {}, "peak_today": {"count": 0, "time": "", "date": ""}}
+    try:
+        with open(STATS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if "dates" not in data:
+                return {"dates": {}, "peak_today": {"count": 0, "time": "", "date": ""}}
+            return data
+    except Exception:
+        return {"dates": {}, "peak_today": {"count": 0, "time": "", "date": ""}}
+
+
+def save_player_stats(data: dict):
+    # Автоочистка: оставляем только последние 7 дней, чтобы статистика не копилась вечно
+    try:
+        dates_keys = sorted(data.get("dates", {}).keys())
+        if len(dates_keys) > 7:
+            for old_date in dates_keys[:-7]:
+                del data["dates"][old_date]
+    except Exception:
+        pass
+
+    tmp_file = f"{STATS_FILE}.tmp"
+    with open(tmp_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
+    os.replace(tmp_file, STATS_FILE)
+
+
+def update_player_activity(online_players: list[str], total_count: int):
+    now = datetime.now(timezone.utc)
+    date_str = now.strftime("%Y-%m-%d")
+    time_str = now.strftime("%H:%M")
+
+    stats = load_player_stats()
+    dates = stats.setdefault("dates", {})
+    day_data = dates.setdefault(date_str, {"players": {}, "peak": 0, "peak_time": time_str})
+
+    # Обновление пика за день
+    if total_count > day_data.get("peak", 0):
+        day_data["peak"] = total_count
+        day_data["peak_time"] = time_str
+
+    # Общий пик (если сегодня)
+    peak_today_dict = stats.setdefault("peak_today", {"count": 0, "time": "", "date": date_str})
+    if peak_today_dict.get("date") != date_str:
+        peak_today_dict["count"] = total_count
+        peak_today_dict["time"] = time_str
+        peak_today_dict["date"] = date_str
+    elif total_count > peak_today_dict.get("count", 0):
+        peak_today_dict["count"] = total_count
+        peak_today_dict["time"] = time_str
+
+    current_status_cache["peak_today"] = peak_today_dict["count"]
+    current_status_cache["peak_time"] = peak_today_dict["time"]
+
+    # Учет времени игроков (каждые CHECK_INTERVAL секунд)
+    increment_minutes = CHECK_INTERVAL / 60.0
+    players_dict = day_data.setdefault("players", {})
+
+    for name in online_players:
+        p_lower = name.lower()
+        if p_lower not in players_dict:
+            players_dict[p_lower] = {
+                "real_name": name,
+                "minutes": 0.0,
+                "last_seen": time_str
+            }
+        players_dict[p_lower]["real_name"] = name  # сохраняем актуальный регистр
+        players_dict[p_lower]["minutes"] += increment_minutes
+        players_dict[p_lower]["last_seen"] = time_str
+
+    save_player_stats(stats)
+
+
 def register_user_if_new(user_key: str):
-    """Registers a platform-prefixed user on first interaction with default settings."""
     users = load_users()
     if user_key not in users:
         users.add(user_key)
@@ -151,8 +235,33 @@ def get_user_time_str(user_key: str, dt: datetime = None) -> str:
     return dt.astimezone(user_tz).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def convert_hhmm_to_user_time(user_key: str, time_hhmm: str) -> str:
+    """Конвертирует строку времени 'HH:MM' (сохраненную в UTC) под часовой пояс пользователя."""
+    if not time_hhmm or ":" not in time_hhmm:
+        return time_hhmm
+    try:
+        parts = time_hhmm.split(":")
+        utc_now = datetime.now(timezone.utc)
+        dt_utc = utc_now.replace(hour=int(parts[0]), minute=int(parts[1]), second=0, microsecond=0)
+
+        settings = get_user_settings(user_key)
+        offset_hours = settings.get("timezone_offset", 0)
+        user_tz = timezone(timedelta(hours=offset_hours))
+        return dt_utc.astimezone(user_tz).strftime("%H:%M")
+    except Exception:
+        return time_hhmm
+
+
+def get_player_check_status_label(target_lower: str) -> str:
+    is_currently_online = target_lower in {p.lower() for p in current_status_cache.get("all_players", [])}
+    if is_currently_online:
+        return "🟢 Online right now"
+    if target_lower == OWNER_NICKNAME.lower() and current_status_cache.get("owner_completely_offline", False):
+        return "🔴 Completely offline"
+    return "🔴 Offline"
+
+
 def html_to_discord_md(text: str) -> str:
-    """Converts basic HTML tags used in Telegram messages into Discord Markdown."""
     text = re.sub(r"<b>(.*?)</b>", r"**\1**", text, flags=re.DOTALL)
     text = re.sub(r"<i>(.*?)</i>", r"*\1*", text, flags=re.DOTALL)
     text = re.sub(r"<code>(.*?)</code>", r"`\1`", text, flags=re.DOTALL)
@@ -160,7 +269,6 @@ def html_to_discord_md(text: str) -> str:
 
 
 async def broadcast(text_template: str, setting_key: str, is_hourly: bool = False):
-    """Broadcasts a message to both Telegram and Discord users according to their settings."""
     settings_data = load_all_user_settings()
     users = load_users()
     utc_now = datetime.now(timezone.utc)
@@ -264,6 +372,8 @@ def get_main_menu_text() -> str:
         "👋 <b>Welcome to MC Watchdog!</b>\n\n"
         "<b>Commands:</b>\n"
         " /status — get current server state\n"
+        " /check &lt;nickname&gt; — check player online stats & info\n"
+        " /stats — general session statistics & peak online\n"
         " /settings — configure display toggles & notifications\n"
         " /stop — disable all auto notifications"
     )
@@ -353,6 +463,116 @@ async def tg_cmd_settings(message: Message):
         "⚙️ <b>Bot Settings & Preferences</b>\n\n"
         "Use the toggle buttons below to choose what information you want to see, manage notifications, and set your timezone.",
         reply_markup=get_tg_settings_keyboard(user_key),
+        parse_mode="HTML"
+    )
+
+
+@dp.message(Command("status"))
+async def tg_cmd_status(message: Message):
+    user_key = f"tg_{message.from_user.id}"
+    register_user_if_new(user_key)
+
+    if current_status_cache["is_down"]:
+        err_msg = current_status_cache.get("last_error")
+        err_details = f"\n<code>{err_msg}</code>" if err_msg else ""
+        await message.answer(
+            f"⚠️ <b>Server is currently unavailable.</b>{err_details}",
+            reply_markup=get_tg_status_keyboard(),
+            parse_mode="HTML"
+        )
+        return
+
+    await message.answer(
+        get_status_text_for_user(user_key),
+        reply_markup=get_tg_status_keyboard(),
+        parse_mode="HTML"
+    )
+
+
+@dp.message(Command("stats"))
+async def tg_cmd_stats(message: Message):
+    user_key = f"tg_{message.from_user.id}"
+    register_user_if_new(user_key)
+
+    stats = load_player_stats()
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    day_data = stats.get("dates", {}).get(today_str, {"players": {}, "peak": 0, "peak_time": "N/A"})
+    players = day_data.get("players", {})
+
+    peak = day_data.get("peak", 0)
+    peak_time_utc = day_data.get("peak_time", "N/A")
+    peak_time_local = convert_hhmm_to_user_time(user_key, peak_time_utc)
+
+    text = [
+        f"📊 <b>Server Statistics for Today ({today_str})</b>\n",
+        f"📈 <b>Peak Online:</b> <code>{peak}</code> players (at {peak_time_local})",
+        f"👥 <b>Unique players tracked today:</b> <code>{len(players)}</code>\n"
+    ]
+
+    if players:
+        sorted_players = sorted(players.values(), key=lambda x: x["minutes"], reverse=True)[:10]
+        text.append("🏆 <b>Top active players today:</b>")
+        for idx, p in enumerate(sorted_players, 1):
+            mins = int(p["minutes"])
+            hours = mins // 60
+            rem_mins = mins % 60
+            time_formatted = f"{hours}h {rem_mins}m" if hours > 0 else f"{rem_mins}m"
+            last_seen_local = convert_hhmm_to_user_time(user_key, p['last_seen'])
+            text.append(f"   {idx}. <code>{p['real_name']}</code> — <b>{time_formatted}</b> (last seen: {last_seen_local})")
+
+    await message.answer("\n".join(text), parse_mode="HTML")
+
+
+@dp.message(Command("check"))
+async def tg_cmd_check(message: Message):
+    user_key = f"tg_{message.from_user.id}"
+    register_user_if_new(user_key)
+
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("⚠️ Please specify a player nickname. Example: <code>/check alexcrish</code>", parse_mode="HTML")
+        return
+
+    target_nick = args[1].strip()
+    target_lower = target_nick.lower()
+
+    stats = load_player_stats()
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    day_data = stats.get("dates", {}).get(today_str, {"players": {}})
+    players = day_data.get("players", {})
+
+    player_info = players.get(target_lower)
+
+    role_info = "Player"
+    if target_lower == OWNER_NICKNAME.lower():
+        role_info = "👑 Server Owner"
+    elif target_lower in [m.lower() for m in MODERATORS]:
+        role_info = "🛡️ Moderator"
+
+    online_status_str = get_player_check_status_label(target_lower)
+
+    if not player_info:
+        await message.answer(
+            f"🔍 <b>Player Info:</b> <code>{target_nick}</code>\n\n"
+            f"🏷️ Role: <b>{role_info}</b>\n"
+            f"📌 Status: <code>{online_status_str}</code>\n\n"
+            f"<i>No recorded activity for today ({today_str}).</i>",
+            parse_mode="HTML"
+        )
+        return
+
+    mins = int(player_info["minutes"])
+    hours = mins // 60
+    rem_mins = mins % 60
+    time_formatted = f"{hours}h {rem_mins}m" if hours > 0 else f"{rem_mins}m"
+    last_seen_local = convert_hhmm_to_user_time(user_key, player_info['last_seen'])
+
+    await message.answer(
+        f"🔍 <b>Player Info:</b> <code>{player_info['real_name']}</code>\n\n"
+        f"🏷️ Role: <b>{role_info}</b>\n"
+        f"📌 Status: <code>{online_status_str}</code>\n"
+        f"⏱️ Online today: <b>{time_formatted}</b>\n"
+        f"🕒 Last seen today: <code>{last_seen_local}</code>",
         parse_mode="HTML"
     )
 
@@ -497,28 +717,6 @@ async def tg_cmd_stop(message: Message):
     )
 
 
-@dp.message(Command("status"))
-async def tg_cmd_status(message: Message):
-    user_key = f"tg_{message.from_user.id}"
-    register_user_if_new(user_key)
-
-    if current_status_cache["is_down"]:
-        err_msg = current_status_cache.get("last_error")
-        err_details = f"\n<code>{err_msg}</code>" if err_msg else ""
-        await message.answer(
-            f"⚠️ <b>Server is currently unavailable.</b>{err_details}",
-            reply_markup=get_tg_status_keyboard(),
-            parse_mode="HTML"
-        )
-        return
-
-    await message.answer(
-        get_status_text_for_user(user_key),
-        reply_markup=get_tg_status_keyboard(),
-        parse_mode="HTML"
-    )
-
-
 # ==========================================
 # DISCORD UI & SLASH COMMANDS
 # ==========================================
@@ -528,7 +726,6 @@ class DiscordTimezoneSelect(discord.ui.Select):
         self.user_key = user_key
         current_offset = get_user_settings(user_key).get("timezone_offset", 0)
         options = []
-        # Discord Select allows up to 25 options; cover UTC-11 to UTC+13 (25 values)
         for offset in range(-11, 14):
             sign = "+" if offset >= 0 else ""
             label = f"UTC {sign}{offset}"
@@ -623,6 +820,90 @@ async def dc_cmd_status(interaction: discord.Interaction):
     await interaction.response.send_message(text, view=DiscordStatusView(user_key), ephemeral=True)
 
 
+@dc_tree.command(name="check", description="Check player online stats & info")
+@app_commands.describe(nickname="Minecraft player nickname")
+async def dc_cmd_check(interaction: discord.Interaction, nickname: str):
+    user_key = f"dc_{interaction.user.id}"
+    register_user_if_new(user_key)
+
+    target_nick = nickname.strip()
+    target_lower = target_nick.lower()
+
+    stats = load_player_stats()
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    day_data = stats.get("dates", {}).get(today_str, {"players": {}})
+    players = day_data.get("players", {})
+
+    player_info = players.get(target_lower)
+
+    role_info = "Player"
+    if target_lower == OWNER_NICKNAME.lower():
+        role_info = "👑 Server Owner"
+    elif target_lower in [m.lower() for m in MODERATORS]:
+        role_info = "🛡️ Moderator"
+
+    online_status_str = get_player_check_status_label(target_lower)
+
+    if not player_info:
+        msg = (
+            f"🔍 **Player Info:** `{target_nick}`\n\n"
+            f"🏷️ Role: **{role_info}**\n"
+            f"📌 Status: `{online_status_str}`\n\n"
+            f"*No recorded activity for today ({today_str}).*"
+        )
+        await interaction.response.send_message(msg, ephemeral=True)
+        return
+
+    mins = int(player_info["minutes"])
+    hours = mins // 60
+    rem_mins = mins % 60
+    time_formatted = f"{hours}h {rem_mins}m" if hours > 0 else f"{rem_mins}m"
+    last_seen_local = convert_hhmm_to_user_time(user_key, player_info['last_seen'])
+
+    msg = (
+        f"🔍 **Player Info:** `{player_info['real_name']}`\n\n"
+        f"🏷️ Role: **{role_info}**\n"
+        f"📌 Status: `{online_status_str}`\n"
+        f"⏱️ Online today: **{time_formatted}**\n"
+        f"🕒 Last seen today: `{last_seen_local}`"
+    )
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+@dc_tree.command(name="stats", description="General session statistics and peak online")
+async def dc_cmd_stats(interaction: discord.Interaction):
+    user_key = f"dc_{interaction.user.id}"
+    register_user_if_new(user_key)
+
+    stats = load_player_stats()
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    day_data = stats.get("dates", {}).get(today_str, {"players": {}, "peak": 0, "peak_time": "N/A"})
+    players = day_data.get("players", {})
+
+    peak = day_data.get("peak", 0)
+    peak_time_utc = day_data.get("peak_time", "N/A")
+    peak_time_local = convert_hhmm_to_user_time(user_key, peak_time_utc)
+
+    text = [
+        f"📊 **Server Statistics for Today ({today_str})**\n",
+        f"📈 **Peak Online:** `{peak}` players (at {peak_time_local})",
+        f"👥 **Unique players tracked today:** `{len(players)}`\n"
+    ]
+
+    if players:
+        sorted_players = sorted(players.values(), key=lambda x: x["minutes"], reverse=True)[:10]
+        text.append("🏆 **Top active players today:**")
+        for idx, p in enumerate(sorted_players, 1):
+            mins = int(p["minutes"])
+            hours = mins // 60
+            rem_mins = mins % 60
+            time_formatted = f"{hours}h {rem_mins}m" if hours > 0 else f"{rem_mins}m"
+            last_seen_local = convert_hhmm_to_user_time(user_key, p['last_seen'])
+            text.append(f"   {idx}. `{p['real_name']}` — **{time_formatted}** (last seen: {last_seen_local})")
+
+    await interaction.response.send_message("\n".join(text), ephemeral=True)
+
+
 @dc_tree.command(name="settings", description="Configure display toggles, notifications, and timezone")
 async def dc_cmd_settings(interaction: discord.Interaction):
     user_key = f"dc_{interaction.user.id}"
@@ -660,7 +941,7 @@ async def on_ready():
 
 
 # ==========================================
-# SHARED MONITORING LOOP
+# SHARED MONITORING LOOP (WITH TIMEOUT FILTERING)
 # ==========================================
 
 async def monitor_loop():
@@ -671,8 +952,9 @@ async def monitor_loop():
     moders_count = None
     moders_last_seen = None
     moders_45_notified = False
-    
+
     server_down_notified = False
+    consecutive_errors = 0  # Счетчик ошибок для защиты от ложных таймаутов
 
     last_reported_hour = -1
     owner_lower = OWNER_NICKNAME.lower()
@@ -685,6 +967,9 @@ async def monitor_loop():
 
         try:
             status = await server.async_status()
+
+            # Успешный ответ — сбрасываем счетчик ошибок сбоя
+            consecutive_errors = 0
             current_status_cache["is_down"] = False
             current_status_cache["last_error"] = None
             current_status_cache["ping"] = round(status.latency)
@@ -714,10 +999,8 @@ async def monitor_loop():
                         )
                     else:
                         query_retry_after = time.monotonic() + QUERY_RETRY_INTERVAL
-                        print("[Player list query returned no names; using status sample]")
-                except (OSError, asyncio.TimeoutError) as e:
+                except (OSError, asyncio.TimeoutError):
                     query_retry_after = time.monotonic() + QUERY_RETRY_INTERVAL
-                    print(f"[Player list query unavailable; using status sample]: {e}")
 
             online_names_lower = {name.lower() for name in all_player_names}
 
@@ -725,16 +1008,28 @@ async def monitor_loop():
             curr_moders_list = [m for m in MODERATORS if m.lower() in online_names_lower]
             curr_moders_count = len(curr_moders_list)
 
-            # Update cache for commands
+            # Update cache for commands BEFORE disk I/O so status never freezes
             current_status_cache["total_players"] = total_players
             current_status_cache["owner_online"] = curr_owner
             current_status_cache["online_moders"] = curr_moders_list
             current_status_cache["all_players"] = all_player_names
             current_status_cache["all_players_complete"] = players_list_complete
 
+            # Обновляем статистику активности игроков за день изолированно от основного статуса
+            try:
+                update_player_activity(all_player_names, total_players)
+            except Exception as stats_err:
+                print(f"[Stats update error]: {stats_err}")
+
             # Hourly report at exact 00 minutes
             if owner_online is not None and current_minute == 0 and last_reported_hour != current_hour:
-                owner_status_str = "🟢 <b>Online</b>" if curr_owner else "🔴 <b>Offline</b>"
+                if curr_owner:
+                    owner_status_str = "🟢 <b>Online</b>"
+                elif current_status_cache.get("owner_completely_offline", False):
+                    owner_status_str = "🔴 <b>Completely offline</b>"
+                else:
+                    owner_status_str = "🔴 <b>Offline</b>"
+
                 owner_line = f"👑 <b>Owner:</b> <code>{OWNER_NICKNAME}</code> — {owner_status_str}"
 
                 if curr_moders_list:
@@ -765,7 +1060,7 @@ async def monitor_loop():
             elif current_minute != 0:
                 last_reported_hour = -1
 
-            # First run initialization (silent sync, no spam on startup)
+            # First run initialization
             if owner_online is None:
                 owner_online = curr_owner
                 moders_count = curr_moders_count
@@ -778,7 +1073,6 @@ async def monitor_loop():
 
             current_timestamp = time.time()
 
-            # Track transitions for owner online/offline status
             if curr_owner and not owner_online:
                 owner_45_notified = False
                 current_status_cache["owner_completely_offline"] = False
@@ -787,15 +1081,12 @@ async def monitor_loop():
                 owner_45_notified = False
                 current_status_cache["owner_completely_offline"] = False
 
-            # Track transitions for moderators online/offline status
             if curr_moders_count > 0 and moders_count == 0:
-                # Moderators came online — reset the 45-minute notification flag for moderators
                 moders_45_notified = False
             elif curr_moders_count == 0 and moders_count > 0:
                 moders_last_seen = current_timestamp
                 moders_45_notified = False
 
-            # 45-minute timeout checks
             owner_45_ready = (
                 not owner_online
                 and owner_last_seen is not None
@@ -813,7 +1104,6 @@ async def monitor_loop():
             owner_online = curr_owner
             moders_count = curr_moders_count
 
-            # Send critical alert only if both are offline >45m and it hasn't been notified yet
             if owner_45_ready and moders_45_ready and not (owner_45_notified and moders_45_notified):
                 await broadcast(
                     f"🚨 <b>CRITICAL STATUS UPDATE</b>\n\n"
@@ -833,20 +1123,24 @@ async def monitor_loop():
                 owner_45_notified = True
 
         except Exception as e:
-            current_status_cache["is_down"] = True
+            consecutive_errors += 1
             err_text = type(e).__name__ if not str(e).strip() else f"{type(e).__name__}: {e}"
             err_text = err_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             current_status_cache["last_error"] = err_text
-            print(f"[Server unavailable]: {e}")
+            print(f"[Server warning / attempt {consecutive_errors}]: {e}")
 
-            if not server_down_notified:
-                await broadcast(
-                    f"🚨 <b>CRITICAL STATUS UPDATE</b>\n\n"
-                    f"⚠️ <b>Server is down!</b>\n"
-                    f"Error: <code>{err_text}</code>",
-                    "notify_prelim"
-                )
-                server_down_notified = True
+            # Защита от ложных таймаутов: фиксируем падение сервера только если ошибок подряд >= SERVER_DOWN_THRESHOLD
+            if consecutive_errors >= SERVER_DOWN_THRESHOLD:
+                current_status_cache["is_down"] = True
+
+                if not server_down_notified:
+                    await broadcast(
+                        f"🚨 <b>CRITICAL STATUS UPDATE</b>\n\n"
+                        f"⚠️ <b>Server is down!</b>\n"
+                        f"Error: <code>{err_text}</code>",
+                        "notify_prelim"
+                    )
+                    server_down_notified = True
 
         await asyncio.sleep(CHECK_INTERVAL)
 
@@ -878,6 +1172,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        pass
-    finally:
-        os._exit(0)
+        sys.exit(0)
