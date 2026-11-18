@@ -33,7 +33,7 @@ USERS_FILE = "users.txt"
 SETTINGS_FILE = "user_settings.json"
 STATS_FILE = "player_stats.json"
 
-# Конфиг для защиты от ложных таймаутов (подтверждение после N ошибок подряд)
+# Threshold for server downtime protection (confirm after N consecutive errors)
 SERVER_DOWN_THRESHOLD = 3
 
 if not TG_TOKEN:
@@ -144,7 +144,7 @@ def load_player_stats() -> dict:
 
 
 def save_player_stats(data: dict):
-    # Автоочистка: оставляем только последние 7 дней, чтобы статистика не копилась вечно
+    # Auto-cleanup: keep only the last 7 days to prevent endless growth
     try:
         dates_keys = sorted(data.get("dates", {}).keys())
         if len(dates_keys) > 7:
@@ -168,12 +168,12 @@ def update_player_activity(online_players: list[str], total_count: int):
     dates = stats.setdefault("dates", {})
     day_data = dates.setdefault(date_str, {"players": {}, "peak": 0, "peak_time": time_str})
 
-    # Обновление пика за день
+    # Update daily peak online
     if total_count > day_data.get("peak", 0):
         day_data["peak"] = total_count
         day_data["peak_time"] = time_str
 
-    # Общий пик (если сегодня)
+    # General peak (if today)
     peak_today_dict = stats.setdefault("peak_today", {"count": 0, "time": "", "date": date_str})
     if peak_today_dict.get("date") != date_str:
         peak_today_dict["count"] = total_count
@@ -186,7 +186,7 @@ def update_player_activity(online_players: list[str], total_count: int):
     current_status_cache["peak_today"] = peak_today_dict["count"]
     current_status_cache["peak_time"] = peak_today_dict["time"]
 
-    # Учет времени игроков (каждые CHECK_INTERVAL секунд)
+    # Track player time (every CHECK_INTERVAL seconds)
     increment_minutes = CHECK_INTERVAL / 60.0
     players_dict = day_data.setdefault("players", {})
 
@@ -198,7 +198,7 @@ def update_player_activity(online_players: list[str], total_count: int):
                 "minutes": 0.0,
                 "last_seen": time_str
             }
-        players_dict[p_lower]["real_name"] = name  # сохраняем актуальный регистр
+        players_dict[p_lower]["real_name"] = name  # preserve actual casing
         players_dict[p_lower]["minutes"] += increment_minutes
         players_dict[p_lower]["last_seen"] = time_str
 
@@ -236,7 +236,7 @@ def get_user_time_str(user_key: str, dt: datetime = None) -> str:
 
 
 def convert_hhmm_to_user_time(user_key: str, time_hhmm: str) -> str:
-    """Конвертирует строку времени 'HH:MM' (сохраненную в UTC) под часовой пояс пользователя."""
+    """Converts a time string 'HH:MM' (saved in UTC) to the user's timezone."""
     if not time_hhmm or ":" not in time_hhmm:
         return time_hhmm
     try:
@@ -954,7 +954,7 @@ async def monitor_loop():
     moders_45_notified = False
 
     server_down_notified = False
-    consecutive_errors = 0  # Счетчик ошибок для защиты от ложных таймаутов
+    consecutive_errors = 0  # Error counter to protect against false timeouts
 
     last_reported_hour = -1
     owner_lower = OWNER_NICKNAME.lower()
@@ -968,7 +968,7 @@ async def monitor_loop():
         try:
             status = await server.async_status()
 
-            # Успешный ответ — сбрасываем счетчик ошибок сбоя
+            # Successful response — reset failure error counter
             consecutive_errors = 0
             current_status_cache["is_down"] = False
             current_status_cache["last_error"] = None
@@ -1015,7 +1015,7 @@ async def monitor_loop():
             current_status_cache["all_players"] = all_player_names
             current_status_cache["all_players_complete"] = players_list_complete
 
-            # Обновляем статистику активности игроков за день изолированно от основного статуса
+            # Update player activity statistics isolated from the main status loop
             try:
                 update_player_activity(all_player_names, total_players)
             except Exception as stats_err:
@@ -1129,7 +1129,7 @@ async def monitor_loop():
             current_status_cache["last_error"] = err_text
             print(f"[Server warning / attempt {consecutive_errors}]: {e}")
 
-            # Защита от ложных таймаутов: фиксируем падение сервера только если ошибок подряд >= SERVER_DOWN_THRESHOLD
+            # Protect against false timeouts: mark server down only if consecutive errors >= SERVER_DOWN_THRESHOLD
             if consecutive_errors >= SERVER_DOWN_THRESHOLD:
                 current_status_cache["is_down"] = True
 
