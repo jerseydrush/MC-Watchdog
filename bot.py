@@ -39,6 +39,7 @@ SERVER_DOWN_THRESHOLD = 3
 # Minecraft color/formatting codes and standard username pattern
 MC_FORMATTING_RE = re.compile(r"[§&][0-9A-FK-ORa-fk-or]")
 MC_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
+MC_COUNTER_RE = re.compile(r"^\d+\s*/\s*\d+\s*on$", re.IGNORECASE)
 
 if not TG_TOKEN:
     raise ValueError("Error: TG_TOKEN not found in .env file!")
@@ -85,15 +86,15 @@ def sanitize_player_names(raw_names) -> list[str]:
         if not raw_name:
             continue
 
-        # Remove legacy color/formatting codes and extract the last valid nickname token
+        # Remove legacy color/formatting codes and ignore slot counters like '5/100 on'
         stripped = MC_FORMATTING_RE.sub("", str(raw_name)).strip()
-        if not stripped:
+        if not stripped or MC_COUNTER_RE.match(stripped):
             continue
 
-        candidate = stripped if MC_USERNAME_RE.match(stripped) else ""
+        candidate = stripped if (MC_USERNAME_RE.match(stripped) and not stripped.isdigit()) else ""
         if not candidate:
             for token in reversed(re.split(r"[^A-Za-z0-9_]+", stripped)):
-                if MC_USERNAME_RE.match(token):
+                if MC_USERNAME_RE.match(token) and not token.isdigit():
                     candidate = token
                     break
 
@@ -292,9 +293,42 @@ def get_player_check_status_label(target_lower: str) -> str:
     is_currently_online = target_lower in {p.lower() for p in current_status_cache.get("all_players", [])}
     if is_currently_online:
         return "🟢 Online right now"
+    if not current_status_cache.get("all_players_complete", True):
+        return "🟡 Possibly offline (partial list)"
     if target_lower == OWNER_NICKNAME.lower() and current_status_cache.get("owner_completely_offline", False):
         return "🔴 Completely offline"
     return "🔴 Offline"
+
+
+def format_staff_status_lines(
+    owner_online: bool,
+    owner_completely_offline: bool,
+    online_moders: list[str],
+    players_list_complete: bool
+) -> tuple[str, str]:
+    """Formats owner and moderator status blocks accounting for partial player lists."""
+    if owner_online:
+        owner_status = "🟢 <b>Online</b>"
+    elif not players_list_complete:
+        owner_status = "🟡 <b>Possibly offline</b> (<i>partial list</i>)"
+    elif owner_completely_offline:
+        owner_status = "🔴 <b>Completely offline</b>"
+    else:
+        owner_status = "🔴 <b>Offline</b>"
+
+    owner_str = f"👑 <b>Owner:</b> <code>{OWNER_NICKNAME}</code> — {owner_status}"
+
+    if online_moders:
+        moders_str = "🛡️ <b>Moderators:</b>\n" + "\n".join(f"   ▫️ <code>{m}</code>" for m in online_moders)
+        if not players_list_complete and len(online_moders) < len(MODERATORS):
+            moders_str += "\n   <i>(Others possibly offline — partial list)</i>"
+    else:
+        if not players_list_complete and MODERATORS:
+            moders_str = "🛡️ <b>Moderators:</b> <i>Possibly offline (partial list)</i>"
+        else:
+            moders_str = "🛡️ <b>Moderators:</b> <i>None online</i>"
+
+    return owner_str, moders_str
 
 
 def html_to_discord_md(text: str) -> str:
@@ -356,24 +390,17 @@ def get_status_text_for_user(user_key: str) -> str:
 
     lines = [f"📊 <b>SERVER STATUS</b>{ping_str}\n<code>{time_str}</code>\n"]
 
-    if st["owner_online"]:
-        owner_status = "🟢 <b>Online</b>"
-    elif st.get("owner_completely_offline", False):
-        owner_status = "🔴 <b>Completely offline</b>"
-    else:
-        owner_status = "🔴 <b>Offline</b>"
-
-    owner_str = f"👑 <b>Owner:</b> <code>{OWNER_NICKNAME}</code> — {owner_status}"
-
-    moders_list = st["online_moders"]
-    if moders_list:
-        moders_str = "🛡️ <b>Moderators:</b>\n" + "\n".join(f"   ▫️ <code>{m}</code>" for m in moders_list)
-    else:
-        moders_str = "🛡️ <b>Moderators:</b> <i>None online</i>"
+    players_list_complete = st.get("all_players_complete", True)
+    owner_str, moders_str = format_staff_status_lines(
+        owner_online=st["owner_online"],
+        owner_completely_offline=st.get("owner_completely_offline", False),
+        online_moders=st["online_moders"],
+        players_list_complete=players_list_complete
+    )
 
     all_players = st.get("all_players", [])
     players_count = str(st["total_players"])
-    if not st.get("all_players_complete", True):
+    if not players_list_complete:
         players_count += ", partial list"
     if all_players:
         players_str = f"👥 <b>Players online ({players_count}):</b>\n" + "\n".join(f"   ▪️ <code>{p}</code>" for p in all_players)
@@ -1059,19 +1086,12 @@ async def monitor_loop():
 
             # Hourly report at exact 00 minutes
             if owner_online is not None and current_minute == 0 and last_reported_hour != current_hour:
-                if curr_owner:
-                    owner_status_str = "🟢 <b>Online</b>"
-                elif current_status_cache.get("owner_completely_offline", False):
-                    owner_status_str = "🔴 <b>Completely offline</b>"
-                else:
-                    owner_status_str = "🔴 <b>Offline</b>"
-
-                owner_line = f"👑 <b>Owner:</b> <code>{OWNER_NICKNAME}</code> — {owner_status_str}"
-
-                if curr_moders_list:
-                    moders_line = "🛡️ <b>Moderators:</b>\n" + "\n".join(f"   ▫️ <code>{m}</code>" for m in curr_moders_list)
-                else:
-                    moders_line = "🛡️ <b>Moderators:</b> <i>None online</i>"
+                owner_line, moders_line = format_staff_status_lines(
+                    owner_online=curr_owner,
+                    owner_completely_offline=current_status_cache.get("owner_completely_offline", False),
+                    online_moders=curr_moders_list,
+                    players_list_complete=players_list_complete
+                )
 
                 if all_player_names:
                     players_count = str(total_players)
@@ -1100,36 +1120,51 @@ async def monitor_loop():
             if owner_online is None:
                 owner_online = curr_owner
                 moders_count = curr_moders_count
-                if not curr_owner:
+                if not curr_owner and players_list_complete:
                     owner_last_seen = time.time()
-                if curr_moders_count == 0:
+                if curr_moders_count == 0 and players_list_complete:
                     moders_last_seen = time.time()
                 await asyncio.sleep(CHECK_INTERVAL)
                 continue
 
             current_timestamp = time.time()
 
-            if curr_owner and not owner_online:
-                owner_45_notified = False
-                current_status_cache["owner_completely_offline"] = False
-            elif not curr_owner and owner_online:
-                owner_last_seen = current_timestamp
-                owner_45_notified = False
+            if curr_owner:
+                if not owner_online:
+                    owner_45_notified = False
+                    current_status_cache["owner_completely_offline"] = False
+                owner_last_seen = None
+            elif players_list_complete:
+                if owner_online or owner_last_seen is None:
+                    owner_last_seen = current_timestamp
+                    owner_45_notified = False
+                    current_status_cache["owner_completely_offline"] = False
+            else:
+                # Partial player list: cannot confirm offline duration reliably
+                owner_last_seen = None
                 current_status_cache["owner_completely_offline"] = False
 
-            if curr_moders_count > 0 and moders_count == 0:
-                moders_45_notified = False
-            elif curr_moders_count == 0 and moders_count > 0:
-                moders_last_seen = current_timestamp
-                moders_45_notified = False
+            if curr_moders_count > 0:
+                if moders_count == 0:
+                    moders_45_notified = False
+                moders_last_seen = None
+            elif players_list_complete:
+                if moders_count > 0 or moders_last_seen is None:
+                    moders_last_seen = current_timestamp
+                    moders_45_notified = False
+            else:
+                # Partial player list: cannot confirm offline duration reliably
+                moders_last_seen = None
 
             owner_45_ready = (
-                not owner_online
+                players_list_complete
+                and not curr_owner
                 and owner_last_seen is not None
                 and (current_timestamp - owner_last_seen >= OFFLINE_TIMEOUT)
             )
             moders_45_ready = (
-                moders_count == 0
+                players_list_complete
+                and curr_moders_count == 0
                 and moders_last_seen is not None
                 and (current_timestamp - moders_last_seen >= OFFLINE_TIMEOUT)
             )
