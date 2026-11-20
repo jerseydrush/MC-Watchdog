@@ -9,6 +9,7 @@ import time
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+import aiohttp
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
@@ -21,12 +22,14 @@ TG_TOKEN = os.getenv("TG_TOKEN")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 SERVER_HOST = os.getenv("SERVER_HOST", "basyasmp.gomc.me")
 OWNER_NICKNAME = os.getenv("OWNER_NICKNAME", "alexcrish")
+OWNER_TIKTOK = os.getenv("OWNER_TIKTOK", "@teamcrish_draft").strip()
 
 # Parse comma-separated moderators preserving original casing
 raw_mods = os.getenv("MODERATORS", "")
 MODERATORS = [m.strip() for m in raw_mods.split(",") if m.strip()]
 
 CHECK_INTERVAL = 15
+STREAM_CHECK_INTERVAL = 120
 OFFLINE_TIMEOUT = 45 * 60
 QUERY_RETRY_INTERVAL = 5 * 60
 USERS_FILE = "users.txt"
@@ -40,6 +43,13 @@ SERVER_DOWN_THRESHOLD = 3
 MC_FORMATTING_RE = re.compile(r"[§&][0-9A-FK-ORa-fk-or]")
 MC_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
 MC_COUNTER_RE = re.compile(r"^\d+\s*/\s*\d+\s*on$", re.IGNORECASE)
+
+# Patterns for detecting active live stream in TikTok HTML/JSON payload
+TT_LIVE_TRUE_RE = re.compile(
+    r'("isLive"\s*:\s*true|"liveRoomId"\s*:\s*"[1-9][0-9]*"|"roomId"\s*:\s*"[1-9][0-9]*")',
+    re.IGNORECASE,
+)
+TT_LIVE_FALSE_RE = re.compile(r'"isLive"\s*:\s*false', re.IGNORECASE)
 
 if not TG_TOKEN:
     raise ValueError("Error: TG_TOKEN not found in .env file!")
@@ -73,8 +83,29 @@ current_status_cache = {
     "ping": None,
     "last_error": None,
     "peak_today": 0,
-    "peak_time": None
+    "peak_time": None,
+    "owner_streaming": False,
+    "last_stream_utc": None,
 }
+
+
+def normalize_tiktok_handle(raw_handle: str) -> str:
+    cleaned = (raw_handle or "").strip()
+    if not cleaned:
+        return ""
+    if "tiktok.com/" in cleaned:
+        cleaned = cleaned.split("tiktok.com/", 1)[1].split("?", 1)[0].strip("/")
+    if not cleaned.startswith("@"):
+        cleaned = f"@{cleaned}"
+    return cleaned
+
+
+OWNER_TIKTOK_HANDLE = normalize_tiktok_handle(OWNER_TIKTOK)
+
+
+def get_tiktok_profile_url(handle: str) -> str:
+    clean_user = handle.lstrip("@")
+    return f"https://www.tiktok.com/@{clean_user}" if clean_user else ""
 
 
 def sanitize_player_names(raw_names) -> list[str]:
@@ -86,7 +117,6 @@ def sanitize_player_names(raw_names) -> list[str]:
         if not raw_name:
             continue
 
-        # Remove legacy color/formatting codes and ignore slot counters like '5/100 on'
         stripped = MC_FORMATTING_RE.sub("", str(raw_name)).strip()
         if not stripped or MC_COUNTER_RE.match(stripped):
             continue
@@ -139,7 +169,7 @@ def default_user_settings() -> dict:
         "notify_prelim": True,
         "show_owner": True,
         "show_moders": True,
-        "show_players": True
+        "show_players": True,
     }
 
 
@@ -168,20 +198,34 @@ def save_all_user_settings(data: dict):
 # ==========================================
 
 def load_player_stats() -> dict:
+    default_struct = {
+        "dates": {},
+        "peak_today": {"count": 0, "time": "", "date": ""},
+        "stream_history": {
+            "handle": OWNER_TIKTOK_HANDLE,
+            "is_live": False,
+            "last_stream_utc": None,
+        },
+    }
     if not os.path.exists(STATS_FILE):
-        return {"dates": {}, "peak_today": {"count": 0, "time": "", "date": ""}}
+        return default_struct
     try:
         with open(STATS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
             if "dates" not in data:
-                return {"dates": {}, "peak_today": {"count": 0, "time": "", "date": ""}}
+                return default_struct
+            data.setdefault("peak_today", {"count": 0, "time": "", "date": ""})
+            data.setdefault("stream_history", {
+                "handle": OWNER_TIKTOK_HANDLE,
+                "is_live": False,
+                "last_stream_utc": None,
+            })
             return data
     except Exception:
-        return {"dates": {}, "peak_today": {"count": 0, "time": "", "date": ""}}
+        return default_struct
 
 
 def save_player_stats(data: dict):
-    # Auto-cleanup: keep only the last 7 days to prevent endless growth
     try:
         dates_keys = sorted(data.get("dates", {}).keys())
         if len(dates_keys) > 7:
@@ -196,6 +240,25 @@ def save_player_stats(data: dict):
     os.replace(tmp_file, STATS_FILE)
 
 
+def sync_stream_state_to_stats(is_live: bool, seen_at_utc: datetime):
+    iso_str = seen_at_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    stats = load_player_stats()
+    sh = stats.setdefault("stream_history", {
+        "handle": OWNER_TIKTOK_HANDLE,
+        "is_live": False,
+        "last_stream_utc": None,
+    })
+    sh["handle"] = OWNER_TIKTOK_HANDLE
+    sh["is_live"] = is_live
+    if is_live:
+        sh["last_stream_utc"] = iso_str
+        current_status_cache["last_stream_utc"] = iso_str
+    elif current_status_cache.get("last_stream_utc") is None and sh.get("last_stream_utc"):
+        current_status_cache["last_stream_utc"] = sh["last_stream_utc"]
+    current_status_cache["owner_streaming"] = is_live
+    save_player_stats(stats)
+
+
 def update_player_activity(online_players: list[str], total_count: int):
     now = datetime.now(timezone.utc)
     date_str = now.strftime("%Y-%m-%d")
@@ -205,12 +268,10 @@ def update_player_activity(online_players: list[str], total_count: int):
     dates = stats.setdefault("dates", {})
     day_data = dates.setdefault(date_str, {"players": {}, "peak": 0, "peak_time": time_str})
 
-    # Update daily peak online
     if total_count > day_data.get("peak", 0):
         day_data["peak"] = total_count
         day_data["peak_time"] = time_str
 
-    # General peak (if today)
     peak_today_dict = stats.setdefault("peak_today", {"count": 0, "time": "", "date": date_str})
     if peak_today_dict.get("date") != date_str:
         peak_today_dict["count"] = total_count
@@ -223,7 +284,6 @@ def update_player_activity(online_players: list[str], total_count: int):
     current_status_cache["peak_today"] = peak_today_dict["count"]
     current_status_cache["peak_time"] = peak_today_dict["time"]
 
-    # Track player time (every CHECK_INTERVAL seconds)
     increment_minutes = CHECK_INTERVAL / 60.0
     players_dict = day_data.setdefault("players", {})
 
@@ -233,9 +293,9 @@ def update_player_activity(online_players: list[str], total_count: int):
             players_dict[p_lower] = {
                 "real_name": name,
                 "minutes": 0.0,
-                "last_seen": time_str
+                "last_seen": time_str,
             }
-        players_dict[p_lower]["real_name"] = name  # preserve actual casing
+        players_dict[p_lower]["real_name"] = name
         players_dict[p_lower]["minutes"] += increment_minutes
         players_dict[p_lower]["last_seen"] = time_str
 
@@ -263,13 +323,15 @@ def get_user_settings(user_key: str) -> dict:
     return cfg
 
 
+def get_user_tz(user_key: str) -> timezone:
+    offset_hours = get_user_settings(user_key).get("timezone_offset", 0)
+    return timezone(timedelta(hours=offset_hours))
+
+
 def get_user_time_str(user_key: str, dt: datetime = None) -> str:
     if dt is None:
         dt = datetime.now(timezone.utc)
-    settings = get_user_settings(user_key)
-    offset_hours = settings.get("timezone_offset", 0)
-    user_tz = timezone(timedelta(hours=offset_hours))
-    return dt.astimezone(user_tz).strftime("%Y-%m-%d %H:%M:%S")
+    return dt.astimezone(get_user_tz(user_key)).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def convert_hhmm_to_user_time(user_key: str, time_hhmm: str) -> str:
@@ -280,13 +342,42 @@ def convert_hhmm_to_user_time(user_key: str, time_hhmm: str) -> str:
         parts = time_hhmm.split(":")
         utc_now = datetime.now(timezone.utc)
         dt_utc = utc_now.replace(hour=int(parts[0]), minute=int(parts[1]), second=0, microsecond=0)
-
-        settings = get_user_settings(user_key)
-        offset_hours = settings.get("timezone_offset", 0)
-        user_tz = timezone(timedelta(hours=offset_hours))
-        return dt_utc.astimezone(user_tz).strftime("%H:%M")
+        return dt_utc.astimezone(get_user_tz(user_key)).strftime("%H:%M")
     except Exception:
         return time_hhmm
+
+
+def format_last_stream_for_user(user_key: str, stats_data: dict = None) -> str:
+    if stats_data is None:
+        stats_data = load_player_stats()
+    sh = stats_data.get("stream_history", {})
+    is_live = bool(current_status_cache.get("owner_streaming") or sh.get("is_live"))
+    last_utc_str = current_status_cache.get("last_stream_utc") or sh.get("last_stream_utc")
+    handle_display = OWNER_TIKTOK_HANDLE or sh.get("handle") or "@teamcrish_draft"
+
+    if is_live:
+        return f"🔴 <b>LIVE now</b> ({handle_display})"
+
+    if not last_utc_str:
+        return f"<i>No stream recorded yet ({handle_display})</i>"
+
+    try:
+        dt_utc = datetime.fromisoformat(last_utc_str.replace("Z", "+00:00"))
+        if dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+        local_dt = dt_utc.astimezone(get_user_tz(user_key))
+        return f"<code>{local_dt.strftime('%Y-%m-%d %H:%M')}</code> ({handle_display})"
+    except Exception:
+        return f"<code>{last_utc_str}</code> ({handle_display})"
+
+
+def get_owner_stream_line_html() -> str:
+    if not OWNER_TIKTOK_HANDLE:
+        return ""
+    profile_url = get_tiktok_profile_url(OWNER_TIKTOK_HANDLE)
+    if current_status_cache.get("owner_streaming"):
+        return f'🎥 <b>Stream:</b> <code>{OWNER_NICKNAME}</code> is <b>LIVE on TikTok</b> (<a href="{profile_url}">{OWNER_TIKTOK_HANDLE}</a>)'
+    return f'🎥 <b>Stream:</b> <code>{OWNER_NICKNAME}</code> is not streaming right now (<code>{OWNER_TIKTOK_HANDLE}</code>)'
 
 
 def get_player_check_status_label(target_lower: str) -> str:
@@ -332,6 +423,7 @@ def format_staff_status_lines(
 
 
 def html_to_discord_md(text: str) -> str:
+    text = re.sub(r'<a\s+href="([^"]+)">(.*?)</a>', r"[\2](\1)", text, flags=re.DOTALL)
     text = re.sub(r"<b>(.*?)</b>", r"**\1**", text, flags=re.DOTALL)
     text = re.sub(r"<i>(.*?)</i>", r"*\1*", text, flags=re.DOTALL)
     text = re.sub(r"<code>(.*?)</code>", r"`\1`", text, flags=re.DOTALL)
@@ -358,7 +450,12 @@ async def broadcast(text_template: str, setting_key: str, is_hourly: bool = Fals
         if user_key.startswith("tg_"):
             tg_id = int(user_key.split("_", 1)[1])
             try:
-                await tg_bot.send_message(chat_id=tg_id, text=text_to_send, parse_mode="HTML")
+                await tg_bot.send_message(
+                    chat_id=tg_id,
+                    text=text_to_send,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
             except Exception as e:
                 print(f"[TG Broadcast error to {tg_id}]: {e}")
 
@@ -395,7 +492,7 @@ def get_status_text_for_user(user_key: str) -> str:
         owner_online=st["owner_online"],
         owner_completely_offline=st.get("owner_completely_offline", False),
         online_moders=st["online_moders"],
-        players_list_complete=players_list_complete
+        players_list_complete=players_list_complete,
     )
 
     all_players = st.get("all_players", [])
@@ -410,6 +507,9 @@ def get_status_text_for_user(user_key: str) -> str:
     has_content = False
     if show_owner:
         lines.append(owner_str)
+        stream_line = get_owner_stream_line_html()
+        if stream_line:
+            lines.append(stream_line)
         has_content = True
 
     if show_moders:
@@ -436,10 +536,40 @@ def get_main_menu_text() -> str:
         "<b>Commands:</b>\n"
         " /status — get current server state\n"
         " /check &lt;nickname&gt; — check player online stats & info\n"
-        " /stats — general session statistics & peak online\n"
+        " /stats — general session statistics, peak online & last stream\n"
         " /settings — configure display toggles & notifications\n"
         " /stop — disable all auto notifications"
     )
+
+
+async def check_tiktok_live_status() -> bool | None:
+    """Returns True if live, False if offline, or None if check was inconclusive."""
+    if not OWNER_TIKTOK_HANDLE:
+        return None
+    url = get_tiktok_profile_url(OWNER_TIKTOK_HANDLE)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+    }
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(url, allow_redirects=True) as resp:
+                if resp.status != 200:
+                    return None
+                html = await resp.text(errors="ignore")
+                if TT_LIVE_TRUE_RE.search(html):
+                    return True
+                if TT_LIVE_FALSE_RE.search(html):
+                    return False
+                return None
+    except Exception as e:
+        print(f"[TikTok stream check warning]: {e}")
+        return None
 
 
 # ==========================================
@@ -467,7 +597,7 @@ def get_tg_settings_keyboard(user_key: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"{prelim_check} Preliminary Alerts", callback_data="toggle_prelim")],
         [InlineKeyboardButton(text=tz_text, callback_data="open_tz_menu")],
         [InlineKeyboardButton(text="🔄 Refresh Status", callback_data="refresh_settings_status")],
-        [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu")]
+        [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
@@ -499,7 +629,7 @@ def get_tg_status_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton(text="🔄 Refresh Status", callback_data="refresh_status")],
         [InlineKeyboardButton(text="⚙️ Settings", callback_data="open_settings")],
-        [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu")]
+        [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
@@ -526,7 +656,7 @@ async def tg_cmd_settings(message: Message):
         "⚙️ <b>Bot Settings & Preferences</b>\n\n"
         "Use the toggle buttons below to choose what information you want to see, manage notifications, and set your timezone.",
         reply_markup=get_tg_settings_keyboard(user_key),
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
 
 
@@ -541,14 +671,15 @@ async def tg_cmd_status(message: Message):
         await message.answer(
             f"⚠️ <b>Server is currently unavailable.</b>{err_details}",
             reply_markup=get_tg_status_keyboard(),
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
         return
 
     await message.answer(
         get_status_text_for_user(user_key),
         reply_markup=get_tg_status_keyboard(),
-        parse_mode="HTML"
+        parse_mode="HTML",
+        disable_web_page_preview=True,
     )
 
 
@@ -565,11 +696,13 @@ async def tg_cmd_stats(message: Message):
     peak = day_data.get("peak", 0)
     peak_time_utc = day_data.get("peak_time", "N/A")
     peak_time_local = convert_hhmm_to_user_time(user_key, peak_time_utc)
+    last_stream_str = format_last_stream_for_user(user_key, stats)
 
     text = [
         f"📊 <b>Server Statistics for Today ({today_str})</b>\n",
         f"📈 <b>Peak Online:</b> <code>{peak}</code> players (at {peak_time_local})",
-        f"👥 <b>Unique players tracked today:</b> <code>{len(players)}</code>\n"
+        f"👥 <b>Unique players tracked today:</b> <code>{len(players)}</code>",
+        f"🎥 <b>Last stream ({OWNER_NICKNAME}):</b> {last_stream_str}\n",
     ]
 
     if players:
@@ -580,10 +713,10 @@ async def tg_cmd_stats(message: Message):
             hours = mins // 60
             rem_mins = mins % 60
             time_formatted = f"{hours}h {rem_mins}m" if hours > 0 else f"{rem_mins}m"
-            last_seen_local = convert_hhmm_to_user_time(user_key, p['last_seen'])
+            last_seen_local = convert_hhmm_to_user_time(user_key, p["last_seen"])
             text.append(f"   {idx}. <code>{p['real_name']}</code> — <b>{time_formatted}</b> (last seen: {last_seen_local})")
 
-    await message.answer("\n".join(text), parse_mode="HTML")
+    await message.answer("\n".join(text), parse_mode="HTML", disable_web_page_preview=True)
 
 
 @dp.message(Command("check"))
@@ -613,14 +746,18 @@ async def tg_cmd_check(message: Message):
         role_info = "🛡️ Moderator"
 
     online_status_str = get_player_check_status_label(target_lower)
+    extra_stream_line = ""
+    if target_lower == OWNER_NICKNAME.lower():
+        extra_stream_line = f"\n🎥 <b>Last stream:</b> {format_last_stream_for_user(user_key, stats)}"
 
     if not player_info:
         await message.answer(
             f"🔍 <b>Player Info:</b> <code>{target_nick}</code>\n\n"
             f"🏷️ Role: <b>{role_info}</b>\n"
-            f"📌 Status: <code>{online_status_str}</code>\n\n"
+            f"📌 Status: <code>{online_status_str}</code>{extra_stream_line}\n\n"
             f"<i>No recorded activity for today ({today_str}).</i>",
-            parse_mode="HTML"
+            parse_mode="HTML",
+            disable_web_page_preview=True,
         )
         return
 
@@ -628,15 +765,16 @@ async def tg_cmd_check(message: Message):
     hours = mins // 60
     rem_mins = mins % 60
     time_formatted = f"{hours}h {rem_mins}m" if hours > 0 else f"{rem_mins}m"
-    last_seen_local = convert_hhmm_to_user_time(user_key, player_info['last_seen'])
+    last_seen_local = convert_hhmm_to_user_time(user_key, player_info["last_seen"])
 
     await message.answer(
         f"🔍 <b>Player Info:</b> <code>{player_info['real_name']}</code>\n\n"
         f"🏷️ Role: <b>{role_info}</b>\n"
-        f"📌 Status: <code>{online_status_str}</code>\n"
+        f"📌 Status: <code>{online_status_str}</code>{extra_stream_line}\n"
         f"⏱️ Online today: <b>{time_formatted}</b>\n"
         f"🕒 Last seen today: <code>{last_seen_local}</code>",
-        parse_mode="HTML"
+        parse_mode="HTML",
+        disable_web_page_preview=True,
     )
 
 
@@ -663,7 +801,7 @@ async def tg_process_callback(callback: CallbackQuery):
                 "⚙️ <b>Bot Settings & Preferences</b>\n\n"
                 "Use the toggle buttons below to choose what information you want to see, manage notifications, and set your timezone.",
                 reply_markup=get_tg_settings_keyboard(user_key),
-                parse_mode="HTML"
+                parse_mode="HTML",
             )
         except Exception:
             pass
@@ -676,7 +814,7 @@ async def tg_process_callback(callback: CallbackQuery):
                 "🌐 <b>Select your Timezone</b>\n\n"
                 "Choose your offset relative to UTC:",
                 reply_markup=get_tg_timezone_keyboard(user_key),
-                parse_mode="HTML"
+                parse_mode="HTML",
             )
         except Exception:
             pass
@@ -697,7 +835,7 @@ async def tg_process_callback(callback: CallbackQuery):
                 "🌐 <b>Select your Timezone</b>\n\n"
                 f"Timezone successfully set to <b>UTC {sign}{offset_val}</b>!",
                 reply_markup=get_tg_timezone_keyboard(user_key),
-                parse_mode="HTML"
+                parse_mode="HTML",
             )
             await callback.answer(f"Timezone updated to UTC {sign}{offset_val}")
         except Exception:
@@ -714,7 +852,8 @@ async def tg_process_callback(callback: CallbackQuery):
             await callback.message.edit_text(
                 get_status_text_for_user(user_key),
                 reply_markup=get_tg_status_keyboard(),
-                parse_mode="HTML"
+                parse_mode="HTML",
+                disable_web_page_preview=True,
             )
         except Exception:
             pass
@@ -744,7 +883,8 @@ async def tg_process_callback(callback: CallbackQuery):
             await callback.message.edit_text(
                 get_status_text_for_user(user_key),
                 reply_markup=get_tg_settings_keyboard(user_key),
-                parse_mode="HTML"
+                parse_mode="HTML",
+                disable_web_page_preview=True,
             )
         except Exception:
             pass
@@ -776,7 +916,7 @@ async def tg_cmd_stop(message: Message):
     await message.answer(
         "🔕 <b>All notifications disabled.</b> You can turn them back on in /settings.",
         reply_markup=get_tg_stop_keyboard(),
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
 
 
@@ -795,7 +935,7 @@ class DiscordTimezoneSelect(discord.ui.Select):
             options.append(discord.SelectOption(
                 label=label,
                 value=str(offset),
-                default=(offset == current_offset)
+                default=(offset == current_offset),
             ))
         super().__init__(placeholder="Select your UTC timezone...", min_values=1, max_values=1, options=options)
 
@@ -810,7 +950,7 @@ class DiscordTimezoneSelect(discord.ui.Select):
         sign = "+" if offset_val >= 0 else ""
         await interaction.response.edit_message(
             content=f"⚙️ **Bot Settings & Preferences**\n\nTimezone updated to **UTC {sign}{offset_val}**!",
-            view=DiscordSettingsView(self.user_key)
+            view=DiscordSettingsView(self.user_key),
         )
 
 
@@ -906,12 +1046,15 @@ async def dc_cmd_check(interaction: discord.Interaction, nickname: str):
         role_info = "🛡️ Moderator"
 
     online_status_str = get_player_check_status_label(target_lower)
+    extra_stream_line = ""
+    if target_lower == OWNER_NICKNAME.lower():
+        extra_stream_line = f"\n🎥 **Last stream:** {html_to_discord_md(format_last_stream_for_user(user_key, stats))}"
 
     if not player_info:
         msg = (
             f"🔍 **Player Info:** `{target_nick}`\n\n"
             f"🏷️ Role: **{role_info}**\n"
-            f"📌 Status: `{online_status_str}`\n\n"
+            f"📌 Status: `{online_status_str}`{extra_stream_line}\n\n"
             f"*No recorded activity for today ({today_str}).*"
         )
         await interaction.response.send_message(msg, ephemeral=True)
@@ -921,19 +1064,19 @@ async def dc_cmd_check(interaction: discord.Interaction, nickname: str):
     hours = mins // 60
     rem_mins = mins % 60
     time_formatted = f"{hours}h {rem_mins}m" if hours > 0 else f"{rem_mins}m"
-    last_seen_local = convert_hhmm_to_user_time(user_key, player_info['last_seen'])
+    last_seen_local = convert_hhmm_to_user_time(user_key, player_info["last_seen"])
 
     msg = (
         f"🔍 **Player Info:** `{player_info['real_name']}`\n\n"
         f"🏷️ Role: **{role_info}**\n"
-        f"📌 Status: `{online_status_str}`\n"
+        f"📌 Status: `{online_status_str}`{extra_stream_line}\n"
         f"⏱️ Online today: **{time_formatted}**\n"
         f"🕒 Last seen today: `{last_seen_local}`"
     )
     await interaction.response.send_message(msg, ephemeral=True)
 
 
-@dc_tree.command(name="stats", description="General session statistics and peak online")
+@dc_tree.command(name="stats", description="General session statistics, peak online and last stream")
 async def dc_cmd_stats(interaction: discord.Interaction):
     user_key = f"dc_{interaction.user.id}"
     register_user_if_new(user_key)
@@ -946,11 +1089,13 @@ async def dc_cmd_stats(interaction: discord.Interaction):
     peak = day_data.get("peak", 0)
     peak_time_utc = day_data.get("peak_time", "N/A")
     peak_time_local = convert_hhmm_to_user_time(user_key, peak_time_utc)
+    last_stream_str = html_to_discord_md(format_last_stream_for_user(user_key, stats))
 
     text = [
         f"📊 **Server Statistics for Today ({today_str})**\n",
         f"📈 **Peak Online:** `{peak}` players (at {peak_time_local})",
-        f"👥 **Unique players tracked today:** `{len(players)}`\n"
+        f"👥 **Unique players tracked today:** `{len(players)}`",
+        f"🎥 **Last stream ({OWNER_NICKNAME}):** {last_stream_str}\n",
     ]
 
     if players:
@@ -961,7 +1106,7 @@ async def dc_cmd_stats(interaction: discord.Interaction):
             hours = mins // 60
             rem_mins = mins % 60
             time_formatted = f"{hours}h {rem_mins}m" if hours > 0 else f"{rem_mins}m"
-            last_seen_local = convert_hhmm_to_user_time(user_key, p['last_seen'])
+            last_seen_local = convert_hhmm_to_user_time(user_key, p["last_seen"])
             text.append(f"   {idx}. `{p['real_name']}` — **{time_formatted}** (last seen: {last_seen_local})")
 
     await interaction.response.send_message("\n".join(text), ephemeral=True)
@@ -975,7 +1120,7 @@ async def dc_cmd_settings(interaction: discord.Interaction):
         "⚙️ **Bot Settings & Preferences**\n\n"
         "Use the buttons and dropdown below to customize your notifications and timezone:",
         view=DiscordSettingsView(user_key),
-        ephemeral=True
+        ephemeral=True,
     )
 
 
@@ -993,7 +1138,7 @@ async def dc_cmd_stop(interaction: discord.Interaction):
 
     await interaction.response.send_message(
         "🔕 **All notifications disabled.** You can turn them back on in `/settings`.",
-        ephemeral=True
+        ephemeral=True,
     )
 
 
@@ -1001,6 +1146,42 @@ async def dc_cmd_stop(interaction: discord.Interaction):
 async def on_ready():
     await dc_tree.sync()
     print(f"Discord bot logged in as {dc_client.user} (ID: {dc_client.user.id})")
+
+
+# ==========================================
+# STREAM MONITOR LOOP (TIKTOK)
+# ==========================================
+
+async def stream_monitor_loop():
+    initial_stats = load_player_stats()
+    sh = initial_stats.get("stream_history", {})
+    current_status_cache["last_stream_utc"] = sh.get("last_stream_utc")
+
+    prev_live: bool | None = None
+
+    while True:
+        live_state = await check_tiktok_live_status()
+        now_utc = datetime.now(timezone.utc)
+
+        if live_state is not None:
+            sync_stream_state_to_stats(live_state, now_utc)
+            if prev_live is False and live_state is True:
+                profile_url = get_tiktok_profile_url(OWNER_TIKTOK_HANDLE)
+                await broadcast(
+                    f"🎥 <b>STREAM STARTED</b>\n\n"
+                    f"👑 <code>{OWNER_NICKNAME}</code> is now <b>LIVE on TikTok</b>!\n"
+                    f"🔗 <a href=\"{profile_url}\">{OWNER_TIKTOK_HANDLE}</a>",
+                    "notify_prelim",
+                )
+            elif prev_live is True and live_state is False:
+                await broadcast(
+                    f"🎥 <b>STREAM ENDED</b>\n\n"
+                    f"👑 <code>{OWNER_NICKNAME}</code> finished streaming on <code>{OWNER_TIKTOK_HANDLE}</code>.",
+                    "notify_prelim",
+                )
+            prev_live = live_state
+
+        await asyncio.sleep(STREAM_CHECK_INTERVAL)
 
 
 # ==========================================
@@ -1017,7 +1198,7 @@ async def monitor_loop():
     moders_45_notified = False
 
     server_down_notified = False
-    consecutive_errors = 0  # Error counter to protect against false timeouts
+    consecutive_errors = 0
 
     last_reported_hour = -1
     owner_lower = OWNER_NICKNAME.lower()
@@ -1031,7 +1212,6 @@ async def monitor_loop():
         try:
             status = await server.async_status()
 
-            # Successful response — reset failure error counter
             consecutive_errors = 0
             current_status_cache["is_down"] = False
             current_status_cache["last_error"] = None
@@ -1071,14 +1251,12 @@ async def monitor_loop():
             curr_moders_list = [m for m in MODERATORS if m.lower() in online_names_lower]
             curr_moders_count = len(curr_moders_list)
 
-            # Update cache for commands BEFORE disk I/O so status never freezes
             current_status_cache["total_players"] = total_players
             current_status_cache["owner_online"] = curr_owner
             current_status_cache["online_moders"] = curr_moders_list
             current_status_cache["all_players"] = all_player_names
             current_status_cache["all_players_complete"] = players_list_complete
 
-            # Update player activity statistics isolated from the main status loop
             try:
                 update_player_activity(all_player_names, total_players)
             except Exception as stats_err:
@@ -1090,8 +1268,11 @@ async def monitor_loop():
                     owner_online=curr_owner,
                     owner_completely_offline=current_status_cache.get("owner_completely_offline", False),
                     online_moders=curr_moders_list,
-                    players_list_complete=players_list_complete
+                    players_list_complete=players_list_complete,
                 )
+
+                stream_line = get_owner_stream_line_html()
+                stream_block = f"\n{stream_line}" if stream_line else ""
 
                 if all_player_names:
                     players_count = str(total_players)
@@ -1106,7 +1287,7 @@ async def monitor_loop():
 
                 hourly_text_template = (
                     f"📈 <b>Hourly update</b> ({{TIME_PLACEHOLDER}}){ping_str} — Players online: <code>{total_players}</code>\n\n"
-                    f"{owner_line}\n\n"
+                    f"{owner_line}{stream_block}\n\n"
                     f"{moders_line}\n\n"
                     f"{players_line}"
                 )
@@ -1116,7 +1297,6 @@ async def monitor_loop():
             elif current_minute != 0:
                 last_reported_hour = -1
 
-            # First run initialization
             if owner_online is None:
                 owner_online = curr_owner
                 moders_count = curr_moders_count
@@ -1140,7 +1320,6 @@ async def monitor_loop():
                     owner_45_notified = False
                     current_status_cache["owner_completely_offline"] = False
             else:
-                # Partial player list: cannot confirm offline duration reliably
                 owner_last_seen = None
                 current_status_cache["owner_completely_offline"] = False
 
@@ -1153,7 +1332,6 @@ async def monitor_loop():
                     moders_last_seen = current_timestamp
                     moders_45_notified = False
             else:
-                # Partial player list: cannot confirm offline duration reliably
                 moders_last_seen = None
 
             owner_45_ready = (
@@ -1180,7 +1358,7 @@ async def monitor_loop():
                     f"🚨 <b>CRITICAL STATUS UPDATE</b>\n\n"
                     f"❌ <code>{OWNER_NICKNAME}</code> is <b>completely offline</b> (>45m).\n"
                     f"❌ <b>All Moderators</b> are <b>completely offline</b> (>45m).",
-                    "notify_prelim"
+                    "notify_prelim",
                 )
                 owner_45_notified = True
                 moders_45_notified = True
@@ -1189,7 +1367,7 @@ async def monitor_loop():
                 await broadcast(
                     f"⚠️ <b>STATUS UPDATE</b>\n\n"
                     f"👑 <code>{OWNER_NICKNAME}</code> is now <b>completely offline</b> (>45m).",
-                    "notify_prelim"
+                    "notify_prelim",
                 )
                 owner_45_notified = True
 
@@ -1200,7 +1378,6 @@ async def monitor_loop():
             current_status_cache["last_error"] = err_text
             print(f"[Server warning / attempt {consecutive_errors}]: {e}")
 
-            # Protect against false timeouts: mark server down only if consecutive errors >= SERVER_DOWN_THRESHOLD
             if consecutive_errors >= SERVER_DOWN_THRESHOLD:
                 current_status_cache["is_down"] = True
 
@@ -1209,7 +1386,7 @@ async def monitor_loop():
                         f"🚨 <b>CRITICAL STATUS UPDATE</b>\n\n"
                         f"⚠️ <b>Server is down!</b>\n"
                         f"Error: <code>{err_text}</code>",
-                        "notify_prelim"
+                        "notify_prelim",
                     )
                     server_down_notified = True
 
@@ -1217,8 +1394,9 @@ async def monitor_loop():
 
 
 async def main():
-    print("MC Watchdog (Telegram + Discord) is running...")
+    print("MC Watchdog (Telegram + Discord + TikTok Stream) is running...")
     monitor_task = asyncio.create_task(monitor_loop())
+    stream_task = asyncio.create_task(stream_monitor_loop())
     service_tasks = [
         asyncio.create_task(dp.start_polling(tg_bot)),
         asyncio.create_task(dc_client.start(DISCORD_TOKEN)),
@@ -1227,14 +1405,14 @@ async def main():
     try:
         done, _ = await asyncio.wait(
             service_tasks,
-            return_when=asyncio.FIRST_COMPLETED
+            return_when=asyncio.FIRST_COMPLETED,
         )
         for task in done:
             task.result()
     finally:
-        for task in [*service_tasks, monitor_task]:
+        for task in [*service_tasks, monitor_task, stream_task]:
             task.cancel()
-        await asyncio.gather(*service_tasks, monitor_task, return_exceptions=True)
+        await asyncio.gather(*service_tasks, monitor_task, stream_task, return_exceptions=True)
         await tg_bot.session.close()
         await dc_client.close()
 

@@ -2,3 +2,4 @@ aiogram
 discord.py
 mcstatus
 python-dotenv
+aiohttp
