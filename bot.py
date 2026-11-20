@@ -36,6 +36,10 @@ STATS_FILE = "player_stats.json"
 # Threshold for server downtime protection (confirm after N consecutive errors)
 SERVER_DOWN_THRESHOLD = 3
 
+# Minecraft color/formatting codes and standard username pattern
+MC_FORMATTING_RE = re.compile(r"[§&][0-9A-FK-ORa-fk-or]")
+MC_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
+
 if not TG_TOKEN:
     raise ValueError("Error: TG_TOKEN not found in .env file!")
 if not DISCORD_TOKEN:
@@ -70,6 +74,38 @@ current_status_cache = {
     "peak_today": 0,
     "peak_time": None
 }
+
+
+def sanitize_player_names(raw_names) -> list[str]:
+    """Strip color/formatting prefixes from Essentials/tab entries and keep valid nicknames."""
+    cleaned_players = []
+    seen_lower = set()
+
+    for raw_name in raw_names:
+        if not raw_name:
+            continue
+
+        # Remove legacy color/formatting codes and extract the last valid nickname token
+        stripped = MC_FORMATTING_RE.sub("", str(raw_name)).strip()
+        if not stripped:
+            continue
+
+        candidate = stripped if MC_USERNAME_RE.match(stripped) else ""
+        if not candidate:
+            for token in reversed(re.split(r"[^A-Za-z0-9_]+", stripped)):
+                if MC_USERNAME_RE.match(token):
+                    candidate = token
+                    break
+
+        if not candidate:
+            continue
+
+        lower_nick = candidate.lower()
+        if lower_nick not in seen_lower:
+            seen_lower.add(lower_nick)
+            cleaned_players.append(candidate)
+
+    return cleaned_players
 
 
 def load_users() -> set[str]:
@@ -976,7 +1012,7 @@ async def monitor_loop():
             server_down_notified = False
 
             sample_players = status.players.sample if status.players.sample else []
-            all_player_names = [p.name for p in sample_players]
+            all_player_names = sanitize_player_names([p.name for p in sample_players])
             total_players = status.players.online
             players_list_complete = len(all_player_names) >= total_players
 
@@ -987,7 +1023,7 @@ async def monitor_loop():
                     query_names = getattr(query_players, "list", None)
                     if query_names is None:
                         query_names = getattr(query_players, "names", [])
-                    query_names = list(query_names)
+                    query_names = sanitize_player_names(query_names)
 
                     if query_status.players.online == 0 or query_names:
                         all_player_names = query_names
