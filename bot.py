@@ -30,6 +30,7 @@ MODERATORS = [m.strip() for m in raw_mods.split(",") if m.strip()]
 
 CHECK_INTERVAL = 15
 STREAM_CHECK_INTERVAL = 120
+STREAM_OFFLINE_CONFIRMATIONS = 2
 OFFLINE_TIMEOUT = 45 * 60
 QUERY_RETRY_INTERVAL = 5 * 60
 USERS_FILE = "users.txt"
@@ -42,7 +43,10 @@ SERVER_DOWN_THRESHOLD = 3
 # Minecraft color/formatting codes and standard username pattern
 MC_FORMATTING_RE = re.compile(r"[§&][0-9A-FK-ORa-fk-or]")
 MC_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
-MC_COUNTER_RE = re.compile(r"^\d+\s*/\s*\d+\s*on$", re.IGNORECASE)
+MC_COUNTER_RE = re.compile(
+    r"^\d+\s*/\s*\d+\s*(on|online|players?)?$|^(on|onli|online|offline|players?)$",
+    re.IGNORECASE,
+)
 
 # Patterns for detecting active live stream in TikTok HTML/JSON payload
 TT_LIVE_TRUE_RE = re.compile(
@@ -124,11 +128,11 @@ def sanitize_player_names(raw_names) -> list[str]:
         candidate = stripped if (MC_USERNAME_RE.match(stripped) and not stripped.isdigit()) else ""
         if not candidate:
             for token in reversed(re.split(r"[^A-Za-z0-9_]+", stripped)):
-                if MC_USERNAME_RE.match(token) and not token.isdigit():
+                if MC_USERNAME_RE.match(token) and not token.isdigit() and not MC_COUNTER_RE.match(token):
                     candidate = token
                     break
 
-        if not candidate:
+        if not candidate or MC_COUNTER_RE.match(candidate):
             continue
 
         lower_nick = candidate.lower()
@@ -351,7 +355,7 @@ def format_last_stream_for_user(user_key: str, stats_data: dict = None) -> str:
     if stats_data is None:
         stats_data = load_player_stats()
     sh = stats_data.get("stream_history", {})
-    is_live = bool(current_status_cache.get("owner_streaming") or sh.get("is_live"))
+    is_live = bool(current_status_cache.get("owner_streaming"))
     last_utc_str = current_status_cache.get("last_stream_utc") or sh.get("last_stream_utc")
     handle_display = OWNER_TIKTOK_HANDLE or sh.get("handle") or "@teamcrish_draft"
 
@@ -381,6 +385,8 @@ def get_owner_stream_line_html() -> str:
 
 
 def get_player_check_status_label(target_lower: str) -> str:
+    if current_status_cache.get("total_players", 0) <= 0:
+        return "🔴 Offline"
     is_currently_online = target_lower in {p.lower() for p in current_status_cache.get("all_players", [])}
     if is_currently_online:
         return "🟢 Online right now"
@@ -495,14 +501,14 @@ def get_status_text_for_user(user_key: str) -> str:
         players_list_complete=players_list_complete,
     )
 
-    all_players = st.get("all_players", [])
+    all_players = st.get("all_players", []) if st.get("total_players", 0) > 0 else []
     players_count = str(st["total_players"])
-    if not players_list_complete:
+    if st["total_players"] > 0 and not players_list_complete:
         players_count += ", partial list"
     if all_players:
         players_str = f"👥 <b>Players online ({players_count}):</b>\n" + "\n".join(f"   ▪️ <code>{p}</code>" for p in all_players)
     else:
-        players_str = f"👥 <b>Players online:</b> <code>{st['total_players']}</code> (<i>No sample</i>)"
+        players_str = f"👥 <b>Players online:</b> <code>{st['total_players']}</code>"
 
     has_content = False
     if show_owner:
@@ -554,6 +560,7 @@ async def check_tiktok_live_status() -> bool | None:
             "Chrome/124.0.0.0 Safari/537.36"
         ),
         "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+        "Cache-Control": "no-cache",
     }
     try:
         timeout = aiohttp.ClientTimeout(total=10)
@@ -562,10 +569,27 @@ async def check_tiktok_live_status() -> bool | None:
                 if resp.status != 200:
                     return None
                 html = await resp.text(errors="ignore")
-                if TT_LIVE_TRUE_RE.search(html):
+                if not html:
+                    return None
+
+                has_live_true = bool(TT_LIVE_TRUE_RE.search(html))
+                has_live_false = bool(TT_LIVE_FALSE_RE.search(html))
+
+                if has_live_true and not has_live_false:
                     return True
-                if TT_LIVE_FALSE_RE.search(html):
+                if has_live_false and not has_live_true:
                     return False
+
+                # If both appear in SSR payload, prefer explicit liveRoomId/roomId only if isLive is not false
+                if has_live_true and has_live_false:
+                    if re.search(r'"isLive"\s*:\s*true', html, re.IGNORECASE):
+                        return True
+                    return False
+
+                # Valid profile HTML loaded without active live markers
+                if "webapp.user-detail" in html or '"userInfo"' in html or '"uniqueId"' in html:
+                    return False
+
                 return None
     except Exception as e:
         print(f"[TikTok stream check warning]: {e}")
@@ -1156,16 +1180,22 @@ async def stream_monitor_loop():
     initial_stats = load_player_stats()
     sh = initial_stats.get("stream_history", {})
     current_status_cache["last_stream_utc"] = sh.get("last_stream_utc")
+    # Always start offline until confirmed live; avoids stale "LIVE" after restart
+    current_status_cache["owner_streaming"] = False
+    if sh.get("is_live"):
+        sync_stream_state_to_stats(False, datetime.now(timezone.utc))
 
-    prev_live: bool | None = None
+    prev_live: bool = False
+    offline_streak: int = 0
 
     while True:
         live_state = await check_tiktok_live_status()
         now_utc = datetime.now(timezone.utc)
 
-        if live_state is not None:
-            sync_stream_state_to_stats(live_state, now_utc)
-            if prev_live is False and live_state is True:
+        if live_state is True:
+            offline_streak = 0
+            sync_stream_state_to_stats(True, now_utc)
+            if not prev_live:
                 profile_url = get_tiktok_profile_url(OWNER_TIKTOK_HANDLE)
                 await broadcast(
                     f"🎥 <b>STREAM STARTED</b>\n\n"
@@ -1173,13 +1203,23 @@ async def stream_monitor_loop():
                     f"🔗 <a href=\"{profile_url}\">{OWNER_TIKTOK_HANDLE}</a>",
                     "notify_prelim",
                 )
-            elif prev_live is True and live_state is False:
-                await broadcast(
-                    f"🎥 <b>STREAM ENDED</b>\n\n"
-                    f"👑 <code>{OWNER_NICKNAME}</code> finished streaming on <code>{OWNER_TIKTOK_HANDLE}</code>.",
-                    "notify_prelim",
-                )
-            prev_live = live_state
+            prev_live = True
+
+        elif live_state is False:
+            if prev_live:
+                offline_streak += 1
+                if offline_streak >= STREAM_OFFLINE_CONFIRMATIONS:
+                    sync_stream_state_to_stats(False, now_utc)
+                    await broadcast(
+                        f"🎥 <b>STREAM ENDED</b>\n\n"
+                        f"👑 <code>{OWNER_NICKNAME}</code> finished streaming on <code>{OWNER_TIKTOK_HANDLE}</code>.",
+                        "notify_prelim",
+                    )
+                    prev_live = False
+                    offline_streak = 0
+            else:
+                offline_streak = 0
+                sync_stream_state_to_stats(False, now_utc)
 
         await asyncio.sleep(STREAM_CHECK_INTERVAL)
 
@@ -1218,24 +1258,27 @@ async def monitor_loop():
             current_status_cache["ping"] = round(status.latency)
             server_down_notified = False
 
-            sample_players = status.players.sample if status.players.sample else []
+            total_players = max(0, int(status.players.online or 0))
+            sample_players = status.players.sample if (status.players.sample and total_players > 0) else []
             all_player_names = sanitize_player_names([p.name for p in sample_players])
-            total_players = status.players.online
-            players_list_complete = len(all_player_names) >= total_players
+            if total_players == 0:
+                all_player_names = []
+            players_list_complete = True if total_players == 0 else (len(all_player_names) >= total_players)
 
-            if not players_list_complete and time.monotonic() >= query_retry_after:
+            if total_players > 0 and not players_list_complete and time.monotonic() >= query_retry_after:
                 try:
                     query_status = await server.async_query(tries=1)
+                    query_total = max(0, int(query_status.players.online or 0))
                     query_players = query_status.players
                     query_names = getattr(query_players, "list", None)
                     if query_names is None:
                         query_names = getattr(query_players, "names", [])
-                    query_names = sanitize_player_names(query_names)
+                    query_names = sanitize_player_names(query_names) if query_total > 0 else []
 
-                    if query_status.players.online == 0 or query_names:
+                    if query_total == 0 or query_names:
                         all_player_names = query_names
-                        total_players = query_status.players.online
-                        players_list_complete = len(all_player_names) >= total_players
+                        total_players = query_total
+                        players_list_complete = True if total_players == 0 else (len(all_player_names) >= total_players)
                         query_retry_after = (
                             0.0 if players_list_complete
                             else time.monotonic() + QUERY_RETRY_INTERVAL
@@ -1245,10 +1288,14 @@ async def monitor_loop():
                 except (OSError, asyncio.TimeoutError):
                     query_retry_after = time.monotonic() + QUERY_RETRY_INTERVAL
 
+            if total_players == 0:
+                all_player_names = []
+                players_list_complete = True
+
             online_names_lower = {name.lower() for name in all_player_names}
 
-            curr_owner = owner_lower in online_names_lower
-            curr_moders_list = [m for m in MODERATORS if m.lower() in online_names_lower]
+            curr_owner = (total_players > 0) and (owner_lower in online_names_lower)
+            curr_moders_list = [m for m in MODERATORS if m.lower() in online_names_lower] if total_players > 0 else []
             curr_moders_count = len(curr_moders_list)
 
             current_status_cache["total_players"] = total_players
@@ -1280,7 +1327,7 @@ async def monitor_loop():
                         players_count += ", partial list"
                     players_line = f"👥 <b>Players online ({players_count}):</b>\n" + "\n".join(f"   ▪️ <code>{p}</code>" for p in all_player_names)
                 else:
-                    players_line = f"👥 <b>Players online:</b> <code>{total_players}</code> (<i>No sample</i>)"
+                    players_line = f"👥 <b>Players online:</b> <code>{total_players}</code>"
 
                 ping_val = current_status_cache.get("ping")
                 ping_str = f" | 🏓 <code>{ping_val}ms</code>" if ping_val is not None else ""
