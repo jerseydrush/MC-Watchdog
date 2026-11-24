@@ -1,1 +1,5 @@
 .env
+player_stats.json
+user_settings.json
+users.txt
+blacklist.json
