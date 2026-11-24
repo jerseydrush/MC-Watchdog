@@ -38,12 +38,17 @@ SETTINGS_FILE = "user_settings.json"
 STATS_FILE = "player_stats.json"
 BLACKLIST_FILE = "blacklist.json"
 
-# Format: {"id_or_key": "ban reason"}
-DEFAULT_BLACKLIST_REASONS: dict[str, str] = {
-    "6862549355": "You are not ПАТАЧНОCÇTY enough",
-    "tg_6862549355": "You are not ПАТАЧНОCÇTY enough",
-    "9018380285": "You are not ПАТАЧНОCÇTY enough",
-    "tg_9018380285": "You are not ПАТАЧНОCÇTY enough",
+# ==========================================
+# BLACKLIST CONFIGURATION (ADD NEW IDs HERE)
+# ==========================================
+DEFAULT_BAN_REASON = "You are not ПАТАЧНОCÇTY enough"
+SHOW_BAN_REASON_TO_USER = True
+
+DEFAULT_BLACKLISTED_IDS: set[str] = {
+    "6862549355",
+    "tg_6862549355",
+    "9018380285",
+    "tg_9018380285",
 }
 
 # Threshold for server downtime protection (confirm after N consecutive errors)
@@ -119,6 +124,11 @@ def load_blacklist() -> set[str]:
                     val = str(item).strip()
                     if val:
                         entries.add(val)
+            elif isinstance(data, dict):
+                for key in data.keys():
+                    val = str(key).strip()
+                    if val:
+                        entries.add(val)
     except Exception as e:
         print(f"[Blacklist load warning]: {e}")
     return entries
@@ -127,20 +137,24 @@ def load_blacklist() -> set[str]:
 def save_blacklist(entries: set[str]):
     tmp_file = f"{BLACKLIST_FILE}.tmp"
     with open(tmp_file, "w", encoding="utf-8") as f:
-        json.dump(sorted(entries), f, indent=4)
+        json.dump(sorted(entries), f, indent=4, ensure_ascii=False)
     os.replace(tmp_file, BLACKLIST_FILE)
+
+
+def get_blacklist_reason(user_key: str | None = None, raw_id: int | str | None = None) -> str | None:
+    if is_blacklisted(user_key=user_key, raw_id=raw_id):
+        return DEFAULT_BAN_REASON
+    return None
 
 
 def is_blacklisted(user_key: str | None = None, raw_id: int | str | None = None) -> bool:
     blacklist = load_blacklist()
-    candidates = set()
+    candidates: set[str] = set()
 
     if raw_id is not None:
         raw_str = str(raw_id).strip()
         if raw_str:
-            candidates.add(raw_str)
-            candidates.add(f"tg_{raw_str}")
-            candidates.add(f"dc_{raw_str}")
+            candidates.update([raw_str, f"tg_{raw_str}", f"dc_{raw_str}"])
 
     if user_key:
         key_str = str(user_key).strip()
@@ -152,6 +166,20 @@ def is_blacklisted(user_key: str | None = None, raw_id: int | str | None = None)
                     candidates.add(pure_id)
 
     return bool(candidates & blacklist)
+
+
+def format_ban_notice_html(user_key: str | None = None, raw_id: int | str | None = None) -> str:
+    reason = get_blacklist_reason(user_key=user_key, raw_id=raw_id)
+    if SHOW_BAN_REASON_TO_USER and reason:
+        return f"🚫 <b>You are banned from this bot.</b>\nReason: <code>{reason}</code>"
+    return "🚫 <b>You are banned from this bot.</b>"
+
+
+def format_ban_notice_plain(user_key: str | None = None, raw_id: int | str | None = None) -> str:
+    reason = get_blacklist_reason(user_key=user_key, raw_id=raw_id)
+    if SHOW_BAN_REASON_TO_USER and reason:
+        return f"🚫 You are banned from this bot.\nReason: {reason}"
+    return "🚫 You are banned from this bot."
 
 
 def normalize_tiktok_handle(raw_handle: str) -> str:
@@ -732,19 +760,33 @@ def get_tg_stop_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+async def tg_ensure_allowed(message_or_cb: Message | CallbackQuery) -> bool:
+    user = message_or_cb.from_user
+    user_key = f"tg_{user.id}" if user else None
+    if is_blacklisted(user_key=user_key, raw_id=user.id if user else None):
+        notice = format_ban_notice_html(user_key=user_key, raw_id=user.id if user else None)
+        if isinstance(message_or_cb, CallbackQuery):
+            await message_or_cb.answer(format_ban_notice_plain(user_key=user_key, raw_id=user.id if user else None), show_alert=True)
+        elif message_or_cb.message:
+            await message_or_cb.answer(notice, parse_mode="HTML")
+        return False
+    if user_key:
+        register_user_if_new(user_key)
+    return True
+
+
 @dp.message(Command("start"))
 async def tg_cmd_start(message: Message):
-    user_key = f"tg_{message.from_user.id}"
-    if not register_user_if_new(user_key):
+    if not await tg_ensure_allowed(message):
         return
     await message.answer(get_main_menu_text(), parse_mode="HTML")
 
 
 @dp.message(Command("settings"))
 async def tg_cmd_settings(message: Message):
-    user_key = f"tg_{message.from_user.id}"
-    if not register_user_if_new(user_key):
+    if not await tg_ensure_allowed(message):
         return
+    user_key = f"tg_{message.from_user.id}"
 
     await message.answer(
         "⚙️ <b>Bot Settings & Preferences</b>\n\n"
@@ -756,9 +798,9 @@ async def tg_cmd_settings(message: Message):
 
 @dp.message(Command("status"))
 async def tg_cmd_status(message: Message):
-    user_key = f"tg_{message.from_user.id}"
-    if not register_user_if_new(user_key):
+    if not await tg_ensure_allowed(message):
         return
+    user_key = f"tg_{message.from_user.id}"
 
     if current_status_cache["is_down"]:
         err_msg = current_status_cache.get("last_error")
@@ -780,9 +822,9 @@ async def tg_cmd_status(message: Message):
 
 @dp.message(Command("stats"))
 async def tg_cmd_stats(message: Message):
-    user_key = f"tg_{message.from_user.id}"
-    if not register_user_if_new(user_key):
+    if not await tg_ensure_allowed(message):
         return
+    user_key = f"tg_{message.from_user.id}"
 
     stats = load_player_stats()
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -817,9 +859,9 @@ async def tg_cmd_stats(message: Message):
 
 @dp.message(Command("check"))
 async def tg_cmd_check(message: Message):
-    user_key = f"tg_{message.from_user.id}"
-    if not register_user_if_new(user_key):
+    if not await tg_ensure_allowed(message):
         return
+    user_key = f"tg_{message.from_user.id}"
 
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
@@ -881,10 +923,9 @@ async def tg_cmd_check(message: Message):
     "refresh_settings_status", "refresh_status", "open_settings", "main_menu"
 ] or c.data.startswith("set_tz_"))
 async def tg_process_callback(callback: CallbackQuery):
-    user_key = f"tg_{callback.from_user.id}"
-    if not register_user_if_new(user_key):
-        await callback.answer("Access denied.", show_alert=True)
+    if not await tg_ensure_allowed(callback):
         return
+    user_key = f"tg_{callback.from_user.id}"
 
     if callback.data == "main_menu":
         try:
@@ -1002,9 +1043,9 @@ async def tg_process_callback(callback: CallbackQuery):
 
 @dp.message(Command("stop"))
 async def tg_cmd_stop(message: Message):
-    user_key = f"tg_{message.from_user.id}"
-    if not register_user_if_new(user_key):
+    if not await tg_ensure_allowed(message):
         return
+    user_key = f"tg_{message.from_user.id}"
 
     settings_data = load_all_user_settings()
     user_cfg = get_user_settings(user_key)
@@ -1024,6 +1065,21 @@ async def tg_cmd_stop(message: Message):
 # DISCORD UI & SLASH COMMANDS
 # ==========================================
 
+async def dc_ensure_allowed(interaction: discord.Interaction) -> bool:
+    user_id = interaction.user.id if interaction.user else None
+    user_key = f"dc_{user_id}" if user_id is not None else None
+    if is_blacklisted(user_key=user_key, raw_id=user_id):
+        msg = format_ban_notice_plain(user_key=user_key, raw_id=user_id)
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+        return False
+    if user_key:
+        register_user_if_new(user_key)
+    return True
+
+
 class DiscordTimezoneSelect(discord.ui.Select):
     def __init__(self, user_key: str):
         self.user_key = user_key
@@ -1040,8 +1096,7 @@ class DiscordTimezoneSelect(discord.ui.Select):
         super().__init__(placeholder="Select your UTC timezone...", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        if not register_user_if_new(self.user_key):
-            await interaction.response.send_message("Access denied.", ephemeral=True)
+        if not await dc_ensure_allowed(interaction):
             return
 
         offset_val = int(self.values[0])
@@ -1090,8 +1145,7 @@ class DiscordSettingsView(discord.ui.View):
 
     def _make_toggle_callback(self, setting_key: str):
         async def callback(interaction: discord.Interaction):
-            if not register_user_if_new(self.user_key):
-                await interaction.response.send_message("Access denied.", ephemeral=True)
+            if not await dc_ensure_allowed(interaction):
                 return
 
             settings_data = load_all_user_settings()
@@ -1112,8 +1166,7 @@ class DiscordStatusView(discord.ui.View):
 
     @discord.ui.button(label="🔄 Refresh Status", style=discord.ButtonStyle.primary)
     async def refresh_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not register_user_if_new(self.user_key):
-            await interaction.response.send_message("Access denied.", ephemeral=True)
+        if not await dc_ensure_allowed(interaction):
             return
 
         text = html_to_discord_md(get_status_text_for_user(self.user_key))
@@ -1122,19 +1175,16 @@ class DiscordStatusView(discord.ui.View):
 
 @dc_tree.command(name="start", description="Welcome message and available commands")
 async def dc_cmd_start(interaction: discord.Interaction):
-    user_key = f"dc_{interaction.user.id}"
-    if not register_user_if_new(user_key):
-        await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not await dc_ensure_allowed(interaction):
         return
     await interaction.response.send_message(html_to_discord_md(get_main_menu_text()), ephemeral=True)
 
 
 @dc_tree.command(name="status", description="Get current Minecraft server status")
 async def dc_cmd_status(interaction: discord.Interaction):
-    user_key = f"dc_{interaction.user.id}"
-    if not register_user_if_new(user_key):
-        await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not await dc_ensure_allowed(interaction):
         return
+    user_key = f"dc_{interaction.user.id}"
     text = html_to_discord_md(get_status_text_for_user(user_key))
     await interaction.response.send_message(text, view=DiscordStatusView(user_key), ephemeral=True)
 
@@ -1142,10 +1192,9 @@ async def dc_cmd_status(interaction: discord.Interaction):
 @dc_tree.command(name="check", description="Check player online stats & info")
 @app_commands.describe(nickname="Minecraft player nickname")
 async def dc_cmd_check(interaction: discord.Interaction, nickname: str):
-    user_key = f"dc_{interaction.user.id}"
-    if not register_user_if_new(user_key):
-        await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not await dc_ensure_allowed(interaction):
         return
+    user_key = f"dc_{interaction.user.id}"
 
     target_nick = nickname.strip()
     target_lower = target_nick.lower()
@@ -1196,10 +1245,9 @@ async def dc_cmd_check(interaction: discord.Interaction, nickname: str):
 
 @dc_tree.command(name="stats", description="General session statistics, peak online and last stream")
 async def dc_cmd_stats(interaction: discord.Interaction):
-    user_key = f"dc_{interaction.user.id}"
-    if not register_user_if_new(user_key):
-        await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not await dc_ensure_allowed(interaction):
         return
+    user_key = f"dc_{interaction.user.id}"
 
     stats = load_player_stats()
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -1234,10 +1282,9 @@ async def dc_cmd_stats(interaction: discord.Interaction):
 
 @dc_tree.command(name="settings", description="Configure display toggles, notifications, and timezone")
 async def dc_cmd_settings(interaction: discord.Interaction):
-    user_key = f"dc_{interaction.user.id}"
-    if not register_user_if_new(user_key):
-        await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not await dc_ensure_allowed(interaction):
         return
+    user_key = f"dc_{interaction.user.id}"
     await interaction.response.send_message(
         "⚙️ **Bot Settings & Preferences**\n\n"
         "Use the buttons and dropdown below to customize your notifications and timezone:",
@@ -1248,10 +1295,9 @@ async def dc_cmd_settings(interaction: discord.Interaction):
 
 @dc_tree.command(name="stop", description="Disable all automatic notifications")
 async def dc_cmd_stop(interaction: discord.Interaction):
-    user_key = f"dc_{interaction.user.id}"
-    if not register_user_if_new(user_key):
-        await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not await dc_ensure_allowed(interaction):
         return
+    user_key = f"dc_{interaction.user.id}"
 
     settings_data = load_all_user_settings()
     user_cfg = get_user_settings(user_key)
