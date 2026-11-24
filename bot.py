@@ -764,11 +764,12 @@ async def tg_ensure_allowed(message_or_cb: Message | CallbackQuery) -> bool:
     user = message_or_cb.from_user
     user_key = f"tg_{user.id}" if user else None
     if is_blacklisted(user_key=user_key, raw_id=user.id if user else None):
-        notice = format_ban_notice_html(user_key=user_key, raw_id=user.id if user else None)
+        notice_html = format_ban_notice_html(user_key=user_key, raw_id=user.id if user else None)
+        notice_plain = format_ban_notice_plain(user_key=user_key, raw_id=user.id if user else None)
         if isinstance(message_or_cb, CallbackQuery):
-            await message_or_cb.answer(format_ban_notice_plain(user_key=user_key, raw_id=user.id if user else None), show_alert=True)
-        elif message_or_cb.message:
-            await message_or_cb.answer(notice, parse_mode="HTML")
+            await message_or_cb.answer(notice_plain, show_alert=True)
+        elif isinstance(message_or_cb, Message):
+            await message_or_cb.answer(notice_html, parse_mode="HTML")
         return False
     if user_key:
         register_user_if_new(user_key)
